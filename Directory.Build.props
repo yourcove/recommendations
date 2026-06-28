@@ -1,0 +1,32 @@
+<Project>
+  <PropertyGroup>
+    <DefaultItemExcludes>$(DefaultItemExcludes);**/bin/**;**/obj/**</DefaultItemExcludes>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <CoveMinVersion Condition="'$(CoveMinVersion)' == ''">0.7.1</CoveMinVersion>
+    <CoveSdkVersion Condition="'$(CoveSdkVersion)' == ''">$(CoveMinVersion)</CoveSdkVersion>
+    <CoveCoreVersion Condition="'$(CoveCoreVersion)' == ''">$(CoveMinVersion)</CoveCoreVersion>
+    <UseLocalCoveSource Condition="'$(UseLocalCoveSource)' == '' and Exists('$(MSBuildThisFileDirectory)..\cove\src\Cove.Sdk\Cove.Sdk.csproj')">true</UseLocalCoveSource>
+    <UseLocalCoveSource Condition="'$(UseLocalCoveSource)' == ''">false</UseLocalCoveSource>
+    <UseLocalCoveCore Condition="'$(UseLocalCoveCore)' == '' and Exists('$(MSBuildThisFileDirectory)..\cove\src\Cove.Core\Cove.Core.csproj')">true</UseLocalCoveCore>
+    <UseLocalCoveCore Condition="'$(UseLocalCoveCore)' == ''">false</UseLocalCoveCore>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="Exists('$(MSBuildProjectDirectory)\extension.json')">
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)\extension.json')">
+    <None Include="extension.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)\dist')">
+    <None Include="dist\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)\docs')">
+    <None Include="docs\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/extensions/">
+    <Project Path="extensions/ExampleDownloader/ExampleDownloader.csproj" />
+    <Project Path="extensions/ExampleScraper/ExampleScraper.csproj" />
+    <Project Path="extensions/ExampleUi/ExampleUi.csproj" />
+  </Folder>
+</Solution>

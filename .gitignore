@@ -1,0 +1,5 @@
+**/bin/*
+**/obj/*
+artifacts/
+*.zip
+.DS_Store

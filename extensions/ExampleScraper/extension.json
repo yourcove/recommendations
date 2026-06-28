@@ -1,0 +1,21 @@
+{
+  "id": "com.example.scraper",
+  "name": "Example Scraper",
+  "version": "0.1.0",
+  "description": "A minimal compiled scraper extension template.",
+  "author": "Example Author",
+  "url": "https://github.com/example/cove-extensions",
+  "categories": [
+    "scraper",
+    "metadata",
+    "integration"
+  ],
+  "minCoveVersion": "0.7.1",
+  "entryDll": "ExampleScraper.dll",
+  "dependencies": {},
+  "permissions": {
+    "network": [],
+    "scraperRuntime": [],
+    "downloaderRuntime": []
+  }
+}

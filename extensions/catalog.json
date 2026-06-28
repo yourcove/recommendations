@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "extensions": [
+    {
+      "name": "ExampleUi",
+      "id": "com.example.ui",
+      "path": "extensions/ExampleUi",
+      "tagPrefix": "example-ui/"
+    },
+    {
+      "name": "ExampleDownloader",
+      "id": "com.example.downloader",
+      "path": "extensions/ExampleDownloader",
+      "tagPrefix": "example-downloader/"
+    },
+    {
+      "name": "ExampleScraper",
+      "id": "com.example.scraper",
+      "path": "extensions/ExampleScraper",
+      "tagPrefix": "example-scraper/"
+    }
+  ]
+}
