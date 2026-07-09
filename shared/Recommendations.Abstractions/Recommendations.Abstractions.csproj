@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Recommendations.Abstractions</AssemblyName>
+    <RootNamespace>Recommendations.Abstractions</RootNamespace>
+  </PropertyGroup>
+
+  <!-- Pure contract library shared by Recommendations.Core and recommender satellites.
+       No Cove dependency: identity/entity references use string entity-type + int id so the
+       contract stays host-agnostic and its types keep a single identity across extension load
+       contexts (listed in each extension.json "sharedAssemblies"). -->
+</Project>

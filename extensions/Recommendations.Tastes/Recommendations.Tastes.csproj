@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Recommendations.Tastes</AssemblyName>
+    <RootNamespace>Recommendations.Tastes</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\shared\Recommendations.Abstractions\Recommendations.Abstractions.csproj" />
+    <ProjectReference Include="..\..\shared\Recommendations.Toolkit\Recommendations.Toolkit.csproj" />
+  </ItemGroup>
+
+  <!-- Cove host contracts (Cove.Sdk + Cove.Core, EF Core, Pgvector) are referenced centrally and
+       compile-only by ..\..\Directory.Build.targets. -->
+</Project>

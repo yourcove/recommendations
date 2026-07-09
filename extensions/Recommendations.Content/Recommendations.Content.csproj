@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Recommendations.Content</AssemblyName>
+    <RootNamespace>Recommendations.Content</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\shared\Recommendations.Abstractions\Recommendations.Abstractions.csproj" />
+  </ItemGroup>
+
+  <!-- Cove host contracts (Cove.Sdk + Cove.Core, EF Core, Pgvector) are referenced centrally and
+       compile-only by ..\..\Directory.Build.targets. -->
+</Project>

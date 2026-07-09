@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/shared/">
+    <Project Path="shared/Recommendations.Abstractions/Recommendations.Abstractions.csproj" />
+    <Project Path="shared/Recommendations.Toolkit/Recommendations.Toolkit.csproj" />
+  </Folder>
+  <Folder Name="/extensions/">
+    <Project Path="extensions/Recommendations.Core/Recommendations.Core.csproj" />
+    <Project Path="extensions/Recommendations.Content/Recommendations.Content.csproj" />
+    <Project Path="extensions/Recommendations.Deep/Recommendations.Deep.csproj" />
+    <Project Path="extensions/Recommendations.Tastes/Recommendations.Tastes.csproj" />
+  </Folder>
+</Solution>

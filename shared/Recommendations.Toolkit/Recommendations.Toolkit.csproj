@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Recommendations.Toolkit</AssemblyName>
+    <RootNamespace>Recommendations.Toolkit</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Recommendations.Abstractions\Recommendations.Abstractions.csproj" />
+  </ItemGroup>
+
+  <!-- Host-aware shared "lego pieces" for building recommenders (affinity, embeddings, metadata, diversity).
+       Unlike Recommendations.Abstractions (host-agnostic, a sharedAssembly), this compiles against the Cove
+       host contracts. They are referenced COMPILE-ONLY (the host provides them at runtime); this mirrors the
+       central wiring in ..\..\Directory.Build.targets, which only targets projects with an extension.json.
+       This DLL is bundled into each referencing extension (it is NOT a sharedAssembly — its static helpers
+       don't cross extension boundaries, and the types it touches are shared via Abstractions / the host). -->
+  <ItemGroup Condition="'$(UseLocalCoveSource)' == 'true'">
+    <ProjectReference Include="..\..\..\cove\src\Cove.Sdk\Cove.Sdk.csproj">
+      <Private>false</Private>
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </ProjectReference>
+  </ItemGroup>
+  <ItemGroup Condition="'$(UseLocalCoveSource)' != 'true'">
+    <PackageReference Include="Cove.Sdk" Version="$(CoveSdkVersion)" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(UseLocalCoveCore)' == 'true'">
+    <ProjectReference Include="..\..\..\cove\src\Cove.Core\Cove.Core.csproj">
+      <Private>false</Private>
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </ProjectReference>
+  </ItemGroup>
+  <ItemGroup Condition="'$(UseLocalCoveCore)' != 'true'">
+    <PackageReference Include="Cove.Core" Version="$(CoveCoreVersion)" />
+  </ItemGroup>
+</Project>

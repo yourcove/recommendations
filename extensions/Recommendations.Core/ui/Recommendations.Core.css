@@ -1,0 +1,17 @@
+/*
+ * Extension-scoped style fixes for reused Cove components.
+ *
+ * The extension's own Tailwind utilities are bundled and loaded AFTER Cove's stylesheet, and the build wraps
+ * every selector in a zero-specificity :where(.recommendations-page,…). So where a Cove component relies on a
+ * responsive override on top of a base utility, the extension's base utility (same specificity, later source)
+ * wins. Restore the intended values here with !important.
+ */
+
+/* ListPage search box: Cove sets `w-full sm:w-[18rem]`, but our `.w-full` clobbers the `sm:` width, stretching
+ * the search bar across the whole toolbar. Pin it back to the standard width from the `sm` breakpoint up. */
+@media (min-width: 640px) {
+  .list-page-search {
+    width: 18rem !important;
+    flex: 0 0 auto !important;
+  }
+}

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Recommendations.Core</AssemblyName>
+    <RootNamespace>Recommendations.Core</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Maps HTTP endpoints, so it needs the ASP.NET Core shared framework (host-provided at runtime). -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="..\..\shared\Recommendations.Abstractions\Recommendations.Abstractions.csproj" />
+  </ItemGroup>
+
+  <!-- Cove host contracts are referenced centrally and compile-only by ..\..\Directory.Build.targets. -->
+</Project>

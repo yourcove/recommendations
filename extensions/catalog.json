@@ -2,22 +2,28 @@
   "schemaVersion": 1,
   "extensions": [
     {
-      "name": "ExampleUi",
-      "id": "com.example.ui",
-      "path": "extensions/ExampleUi",
-      "tagPrefix": "example-ui/"
+      "name": "Recommendations.Core",
+      "id": "cove.community.recommendations.core",
+      "path": "extensions/Recommendations.Core",
+      "tagPrefix": "core/"
     },
     {
-      "name": "ExampleDownloader",
-      "id": "com.example.downloader",
-      "path": "extensions/ExampleDownloader",
-      "tagPrefix": "example-downloader/"
+      "name": "Recommendations.Content",
+      "id": "cove.community.recommendations.content",
+      "path": "extensions/Recommendations.Content",
+      "tagPrefix": "content/"
     },
     {
-      "name": "ExampleScraper",
-      "id": "com.example.scraper",
-      "path": "extensions/ExampleScraper",
-      "tagPrefix": "example-scraper/"
+      "name": "Recommendations.Deep",
+      "id": "cove.community.recommendations.deep",
+      "path": "extensions/Recommendations.Deep",
+      "tagPrefix": "deep/"
+    },
+    {
+      "name": "Recommendations.Tastes",
+      "id": "cove.community.recommendations.tastes",
+      "path": "extensions/Recommendations.Tastes",
+      "tagPrefix": "tastes/"
     }
   ]
 }

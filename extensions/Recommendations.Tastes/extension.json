@@ -1,0 +1,21 @@
+{
+  "id": "cove.community.recommendations.tastes",
+  "name": "Recommendations: Tastes",
+  "version": "0.1.0",
+  "description": "Two recommenders exploring taste structure: a multi-cluster recommender (distinct niches, each with its own visual + tag profile) that exposes your tastes for inspection, and a no-cluster global-affinity recommender.",
+  "author": "skier233",
+  "url": "https://github.com/skier233/recommendations",
+  "categories": [
+    "recommendations",
+    "discovery",
+    "ai"
+  ],
+  "minCoveVersion": "0.7.1",
+  "entryDll": "Recommendations.Tastes.dll",
+  "sharedAssemblies": [
+    "Recommendations.Abstractions"
+  ],
+  "dependencies": {
+    "cove.community.recommendations.core": ">=0.1.0"
+  }
+}
