@@ -5,8 +5,9 @@
   </Folder>
   <Folder Name="/extensions/">
     <Project Path="extensions/Recommendations.Core/Recommendations.Core.csproj" />
-    <Project Path="extensions/Recommendations.Content/Recommendations.Content.csproj" />
-    <Project Path="extensions/Recommendations.Deep/Recommendations.Deep.csproj" />
     <Project Path="extensions/Recommendations.Tastes/Recommendations.Tastes.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Recommendations.Tests/Recommendations.Tests.csproj" />
   </Folder>
 </Solution>

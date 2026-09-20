@@ -15,3 +15,47 @@
     flex: 0 0 auto !important;
   }
 }
+
+/*
+ * The same collision, generalised: rather than patch each Cove element, restore the *responsive variant class*
+ * itself. Every rule below is "this `sm:`/`lg:`/`max-sm:` utility is clobbered by a base utility the extension
+ * also ships, so re-assert it at the breakpoint it belongs to". Each one is a Cove class the Recommended page
+ * actually renders; the base utility that shadows it is named in the comment.
+ *
+ * To find new collisions after a Cove upgrade: take the plain (unprefixed) class selectors out of
+ * `dist/bundle.css`, then look for Cove markup where the same element carries both that base class and a
+ * responsive variant of the same property.
+ */
+
+/* Below `sm`, ListPage's control wrapper is `display: contents` so the phone toolbar layout is unchanged —
+ * shadowed by our `.flex`. */
+@media (max-width: 639px) {
+  .max-sm\:contents { @apply contents!; }
+}
+
+/* Cove sizes its toolbar/cards for touch first and shrinks them from `sm` up. Without these the whole page
+ * renders at mobile metrics on desktop: taller selects and icon buttons, `text-sm` toolbar labels, chunkier
+ * tag/performer badges — which is also what pushes the toolbar over its width budget and makes it wrap. */
+@media (min-width: 640px) {
+  .sm\:px-2 { @apply px-2!; }           /* shadowed by .px-2.5 — toolbar selects, card badges */
+  .sm\:px-2\.5 { @apply px-2.5!; }     /* shadowed by .px-3   — toolbar container */
+  .sm\:py-0\.5 { @apply py-0.5!; }     /* shadowed by .py-1   — card badges */
+  .sm\:py-1 { @apply py-1!; }           /* shadowed by .py-2   — toolbar selects, pagination */
+  .sm\:py-1\.5 { @apply py-1.5!; }     /* shadowed by .py-2   — search input, sort menu */
+  .sm\:py-2 { @apply py-2!; }           /* shadowed by .py-3   — toolbar container */
+  .sm\:p-1\.5 { @apply p-1.5!; }       /* shadowed by .p-2    — toolbar icon buttons */
+  .sm\:text-xs { @apply text-xs!; }     /* shadowed by .text-sm — toolbar controls, pagination */
+  .sm\:text-lg { @apply text-lg!; }     /* shadowed by .text-base — feed card titles */
+  .sm\:absolute { @apply absolute!; }   /* shadowed by .fixed  — sort menu popover */
+  .sm\:w-auto { @apply w-auto!; }       /* shadowed by .w-9    — rating stars */
+  .sm\:justify-start { @apply justify-start!; } /* shadowed by .justify-center — engagement bar */
+}
+
+/* From `lg` the toolbar stops wrapping and becomes three sections (title | controls | operations). Our
+ * `.flex-wrap` and `.flex-1` shadowed both halves of that, so the controls were squeezed into a third of the
+ * toolbar and spilled the page-size select and zoom slider onto a second row on wide screens. */
+@media (min-width: 1024px) {
+  .lg\:flex-nowrap { @apply flex-nowrap!; }        /* shadowed by .flex-wrap on .list-page-toolbar */
+  .lg\:flex-initial { @apply flex-initial!; }      /* shadowed by .flex-1 on .list-page-controls */
+  .lg\:min-w-\[12rem\] { @apply min-w-[12rem]!; } /* shadowed by .min-w-0 on .list-page-title-group */
+}

@@ -22,8 +22,8 @@ public sealed class ClusterRecommender(IServiceScopeFactory scopeFactory) : IRec
 
     private static readonly RecommenderDescriptor Descriptor = new(
         RecommenderId,
-        "Taste clusters (multi-niche)",
-        "Splits your taste into distinct clusters, each with its own visual + tag profile (performers stay global). Recommends across your niches, or scope to one. See your clusters in the Tastes tab.",
+        "Taste clusters",
+        "Splits your taste into distinct clusters, each with its own visual + tag profile (performers stay global), and recommends across them or from one. Simpler than the full taste model — visuals and tags only, no per-aspect scoring — which makes it a clear way to see how your taste breaks up.",
         [RecommendationContext.GlobalFeed, RecommendationContext.SimilarToEntity, RecommendationContext.ScoreItems],
         SourceEntityTypes: ["video"],
         TargetEntityTypes: ["video"],
@@ -35,7 +35,17 @@ public sealed class ClusterRecommender(IServiceScopeFactory scopeFactory) : IRec
             new RecommenderKnob("tagWeight", "Tag weight", 0, 1, 0.30, "Per-cluster tag affinity."),
             new RecommenderKnob("performerWeight", "Performer weight", 0, 1, 0.25, "Global performer affinity."),
             new RecommenderKnob("noveltySimilarityBalance", "Novelty vs similarity", 0, 1, 0.30, "Diversify the final list."),
-        ]);
+        ],
+        ScoreFields: RankedFeed.BasicScoreFields,
+        SupportsRandomSort: true);
+
+    /// <summary>Candidates pulled per cluster. Deliberately a FIXED size rather than derived from the page size:
+    /// the pool is the universe this recommender ranks and pages through, so sizing it per request would make
+    /// page 2 empty and report a total that cuts infinite scroll short.</summary>
+    private const int PoolPerCluster = 400;
+    private const int SeedPool = 600;
+    /// <summary>How deep the diversity re-rank reaches. Fixed, so paging stays consistent.</summary>
+    private const int MmrWindow = 400;
 
     public RecommenderDescriptor Describe() => Descriptor;
 
@@ -45,7 +55,7 @@ public sealed class ClusterRecommender(IServiceScopeFactory scopeFactory) : IRec
         await using var scope = _scopeFactory.CreateAsyncScope();
         var sp = scope.ServiceProvider;
         var built = await BuildAsync(userId, core, sp, cancellationToken);
-        return await DescribeClustersAsync(built, sp.GetRequiredService<DbContext>(), cancellationToken);
+        return DescribeClusters(built);
     }
 
     // ── ITasteProfile: aggregate tag affinity across clusters + global performers ─
@@ -88,7 +98,7 @@ public sealed class ClusterRecommender(IServiceScopeFactory scopeFactory) : IRec
         {
             var seedVec = (await RecHelpers.GetVisualVectorsAsync(repo, [s.EntityId], cancellationToken)).GetValueOrDefault(s.EntityId);
             if (seedVec is null || (seedVec.Feature is null && seedVec.Semantic is null)) return Empty("seed has no visual embedding");
-            var candIds = await RecHelpers.KnnUnionAsync(search, seedVec.Feature, seedVec.Semantic, request.Limit * 6 + 50, new HashSet<int> { s.EntityId }, cancellationToken);
+            var candIds = await RecHelpers.KnnUnionAsync(search, seedVec.Feature, seedVec.Semantic, SeedPool, new HashSet<int> { s.EntityId }, cancellationToken);
             var candVecs = await RecHelpers.GetVisualVectorsAsync(repo, candIds, cancellationToken);
             var visualScore = new Dictionary<int, double>();
             foreach (var id in candIds)
@@ -103,10 +113,15 @@ public sealed class ClusterRecommender(IServiceScopeFactory scopeFactory) : IRec
             : built.Clusters;
         if (targets.Count == 0) targets = built.Clusters;
 
+        // A host-supplied universe (the standard filter/search) REPLACES candidate generation — otherwise a
+        // filter would silently do nothing here, since the KNN pool has no idea what the user filtered to.
         var allCand = new HashSet<int>();
-        foreach (var cluster in targets)
-            foreach (var id in await RecHelpers.KnnUnionAsync(search, cluster.FeatCentroid, cluster.SemCentroid, request.Limit * 2 + 40, built.Seen, cancellationToken))
-                allCand.Add(id);
+        if (request.CandidateIds is { Count: > 0 } filtered)
+            foreach (var id in filtered) allCand.Add(id);
+        else
+            foreach (var cluster in targets)
+                foreach (var id in await RecHelpers.KnnUnionAsync(search, cluster.FeatCentroid, cluster.SemCentroid, PoolPerCluster, built.Seen, cancellationToken))
+                    allCand.Add(id);
         var candIds2 = allCand.ToList();
         var candVecs2 = await RecHelpers.GetVisualVectorsAsync(repo, candIds2, cancellationToken);
         var visualScore2 = new Dictionary<int, double>();
@@ -178,16 +193,21 @@ public sealed class ClusterRecommender(IServiceScopeFactory scopeFactory) : IRec
         double den = Math.Max(1e-9, w.visual + w.tag + w.perf);
         var scored = rows.Select(r => (r.id, score: (w.visual * r.visual + w.tag * (r.tagRaw / maxTag) + w.perf * r.perf) / den)).ToList();
 
-        var order = RecHelpers.MmrIds(scored, vectors, novelty, request.Limit + request.Offset).Skip(request.Offset).Take(request.Limit).ToList();
         var byId = rows.ToDictionary(r => r.id);
-        var scoreById = scored.ToDictionary(s => s.id, s => s.score);
+        var confidence = Math.Min(1.0, built.LikedCount / 15.0);
+        var candidates = scored
+            .Select(x => new ScoredCandidate(x.id, Math.Clamp(x.score, 0, 1), confidence,
+                RankedFeed.BasicDimensions(Math.Clamp(x.score, 0, 1), confidence)))
+            .ToList();
 
-        var names = await GatherNamesAsync(db, order.SelectMany(id => byId[id].topTags), order.SelectMany(id => byId[id].topPerfs), ct);
+        // Names are only needed for the page RankedFeed actually returns, but the explanation callback is
+        // synchronous, so resolve them for the whole (bounded) pool up front.
+        var names = await GatherNamesAsync(db, rows.SelectMany(r => r.topTags), rows.SelectMany(r => r.topPerfs), ct);
         var labelByCluster = built.Clusters.ToDictionary(c => c.Index, c => c.Label);
 
-        var items = order.Select(id =>
+        Explanation Explain(ScoredCandidate c)
         {
-            var r = byId[id];
+            var r = byId[c.Id];
             var tag = r.tagRaw / maxTag;
             var factors = new List<ExplanationFactor>
             {
@@ -198,17 +218,27 @@ public sealed class ClusterRecommender(IServiceScopeFactory scopeFactory) : IRec
                 factors.Add(new("tags", "Tags (this cluster)", w.tag * tag / den, string.Join(", ", r.topTags.Select(t => names.Tags.GetValueOrDefault(t, $"#{t}")))));
             if (r.topPerfs.Count > 0)
                 factors.Add(new("performers", "Performers", w.perf * r.perf / den, string.Join(", ", r.topPerfs.Select(p => names.Perfs.GetValueOrDefault(p, $"#{p}")))));
-            return new ItemScore("video", id, Math.Clamp(scoreById[id], 0, 1), Math.Min(1.0, built.LikedCount / 15.0),
-                new Explanation($"{labelByCluster.GetValueOrDefault(r.cluster, "cluster")} · {Band(scoreById[id])}", factors));
-        }).ToList();
+            return new Explanation($"{labelByCluster.GetValueOrDefault(r.cluster, "cluster")} · {Band(c.Score)}", factors);
+        }
 
-        return new RecommendationResult(items, Diagnostics: new Dictionary<string, object>
-        {
-            ["recommender"] = RecommenderId,
-            ["clusters"] = built.Clusters.Count,
-            ["scopedCluster"] = request.ClusterId ?? "all",
-            ["candidates"] = ids.Count,
-        });
+        return RankedFeed.Build(request, "video", candidates, RankedFeed.BasicDimensionKeys, Explain,
+            new Dictionary<string, object>
+            {
+                ["recommender"] = RecommenderId,
+                ["clusters"] = built.Clusters.Count,
+                ["scopedCluster"] = request.ClusterId ?? "all",
+                ["candidates"] = ids.Count,
+            },
+            // MMR diversity, over a bounded window so the greedy stays cheap and deterministic.
+            ordered =>
+            {
+                if (novelty <= 1e-3) return ordered;
+                var window = Math.Min(ordered.Count, MmrWindow);
+                var head = ordered.Take(window).ToList();
+                var picked = RecHelpers.MmrIds(head.Select(c => (c.Id, c.Score)).ToList(), vectors, novelty, window);
+                var byCandidate = head.ToDictionary(c => c.Id);
+                return picked.Select(id => byCandidate[id]).Concat(ordered.Skip(window)).ToList();
+            });
     }
 
     // ── Clustering ───────────────────────────────────────────────────────────
@@ -275,18 +305,12 @@ public sealed class ClusterRecommender(IServiceScopeFactory scopeFactory) : IRec
         return new Built(clusters, performerAff, seen, likedVec.Count);
     }
 
-    private async Task<IReadOnlyList<TasteCluster>> DescribeClustersAsync(Built built, DbContext db, CancellationToken ct)
-    {
-        var allTopTagIds = built.Clusters.SelectMany(c => c.TagAffinity.OrderByDescending(kv => kv.Value).Take(6).Select(kv => kv.Key));
-        var names = await RecHelpers.TagNamesAsync(db, allTopTagIds, ct);
-        return built.Clusters.Select(c => new TasteCluster(
+    private static IReadOnlyList<TasteCluster> DescribeClusters(Built built) =>
+        built.Clusters.Select(c => new TasteCluster(
             c.Index.ToString(),
             c.Label,
             c.LikedIds.Count,
-            c.LikedIds.Take(8).Select(id => new EntityRef("video", id)).ToList(),
-            c.TagAffinity.OrderByDescending(kv => kv.Value).Take(6).Select(kv => new ClusterTag(names.GetValueOrDefault(kv.Key, $"#{kv.Key}"), kv.Value)).ToList(),
             $"{c.LikedIds.Count} liked videos")).ToList();
-    }
 
     // ── Small helpers ────────────────────────────────────────────────────────
     private static int NearestCentroidIndex(List<float[]> centroids, float[] p)

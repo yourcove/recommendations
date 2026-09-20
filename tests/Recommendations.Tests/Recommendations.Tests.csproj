@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Recommendations.Tests</AssemblyName>
+    <RootNamespace>Recommendations.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\shared\Recommendations.Abstractions\Recommendations.Abstractions.csproj" />
+    <ProjectReference Include="..\..\shared\Recommendations.Toolkit\Recommendations.Toolkit.csproj" />
+    <ProjectReference Include="..\..\extensions\Recommendations.Core\Recommendations.Core.csproj" />
+    <ProjectReference Include="..\..\extensions\Recommendations.Tastes\Recommendations.Tastes.csproj" />
+  </ItemGroup>
+
+  <!-- This project has no extension.json, so Directory.Build.targets does NOT wire the Cove host contracts for
+       it — but it loads assemblies that were compiled against them, so it needs them at RUNTIME (where an
+       extension gets them from the host process). Reference them normally, copy-local, unlike the extensions. -->
+  <ItemGroup Condition="'$(UseLocalCoveSource)' == 'true'">
+    <ProjectReference Include="..\..\..\cove\src\Cove.Sdk\Cove.Sdk.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(UseLocalCoveSource)' != 'true'">
+    <PackageReference Include="Cove.Sdk" Version="$(CoveSdkVersion)" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(UseLocalCoveCore)' == 'true'">
+    <ProjectReference Include="..\..\..\cove\src\Cove.Core\Cove.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(UseLocalCoveCore)' != 'true'">
+    <PackageReference Include="Cove.Core" Version="$(CoveCoreVersion)" />
+  </ItemGroup>
+</Project>

@@ -20,8 +20,8 @@ public sealed class AffinityRecommender(IServiceScopeFactory scopeFactory) : IRe
 
     private static readonly RecommenderDescriptor Descriptor = new(
         RecommenderId,
-        "Global affinity (no clustering)",
-        "One global taste profile: overall tag, visual, performer, and studio affinity — no niches. A baseline to compare clustering against.",
+        "Overall affinity",
+        "One global taste profile — your overall tag, visual, performer and studio affinity, with no clusters and no per-aspect scoring. The simplest of the three, and the baseline the other two are worth judging against.",
         [RecommendationContext.GlobalFeed, RecommendationContext.SimilarToEntity, RecommendationContext.ScoreItems],
         SourceEntityTypes: ["video"],
         TargetEntityTypes: ["video"],
@@ -34,7 +34,17 @@ public sealed class AffinityRecommender(IServiceScopeFactory scopeFactory) : IRe
             new RecommenderKnob("performerWeight", "Performer weight", 0, 1, 0.25, "Overall performer affinity."),
             new RecommenderKnob("studioWeight", "Studio weight", 0, 1, 0.05, "Overall studio affinity."),
             new RecommenderKnob("noveltySimilarityBalance", "Novelty vs similarity", 0, 1, 0.30, "Diversify the final list."),
-        ]);
+        ],
+        ScoreFields: RankedFeed.BasicScoreFields,
+        SupportsRandomSort: true);
+
+    /// <summary>Candidate pool size. Deliberately FIXED rather than derived from the page size: the pool is the
+    /// universe this recommender ranks and pages through, so sizing it per request would make page 2 empty and
+    /// report a total that cuts infinite scroll short.</summary>
+    private const int Pool = 1200;
+    private const int SeedPool = 600;
+    /// <summary>How deep the diversity re-rank reaches. Fixed, so paging stays consistent.</summary>
+    private const int MmrWindow = 400;
 
     public RecommenderDescriptor Describe() => Descriptor;
 
@@ -64,15 +74,17 @@ public sealed class AffinityRecommender(IServiceScopeFactory scopeFactory) : IRe
         // spaces (feature primary + semantic complementary) and union the neighbours.
         HashSet<int> exclude = profile.Seen;
         float[]? featQuery = profile.FeatCentroid, semQuery = profile.SemCentroid;
-        int k = request.Limit * 3 + 50;
+        int k = Pool;
         if (request.Context == RecommendationContext.SimilarToEntity && request.Seed is { } s && s.EntityType.Equals("video", StringComparison.OrdinalIgnoreCase))
         {
             var seedVec = (await RecHelpers.GetVisualVectorsAsync(repo, [s.EntityId], cancellationToken)).GetValueOrDefault(s.EntityId);
             if (seedVec is null || (seedVec.Feature is null && seedVec.Semantic is null)) return Empty("seed has no visual embedding");
-            featQuery = seedVec.Feature; semQuery = seedVec.Semantic; exclude = [s.EntityId]; k = request.Limit * 6 + 50;
+            featQuery = seedVec.Feature; semQuery = seedVec.Semantic; exclude = [s.EntityId]; k = SeedPool;
         }
 
-        var candIds = await RecHelpers.KnnUnionAsync(search, featQuery, semQuery, k, exclude, cancellationToken);
+        var candIds = request.CandidateIds is { Count: > 0 } filtered
+            ? filtered.Distinct().ToList()
+            : await RecHelpers.KnnUnionAsync(search, featQuery, semQuery, k, exclude, cancellationToken);
         if (candIds.Count == 0) return Empty("no unseen candidates");
         var candVecs = await RecHelpers.GetVisualVectorsAsync(repo, candIds, cancellationToken);
         var vectors = new Dictionary<int, float[]>();
@@ -104,22 +116,39 @@ public sealed class AffinityRecommender(IServiceScopeFactory scopeFactory) : IRe
         var den = Math.Max(1e-9, w.visual + w.tag + w.perf + w.studio);
         var scored = rows.Select(r => (r.id, score: (w.visual * r.visual + w.tag * (r.tagRaw / maxTag) + w.perf * r.perf + w.studio * r.studio) / den)).ToList();
 
-        var order = RecHelpers.MmrIds(scored, vectors, novelty, request.Limit + request.Offset).Skip(request.Offset).Take(request.Limit).ToList();
         var byId = rows.ToDictionary(r => r.id);
-        var scoreById = scored.ToDictionary(s => s.id, s => s.score);
-        var names = new { Tags = await RecHelpers.TagNamesAsync(db, order.SelectMany(id => byId[id].topTags), cancellationToken), Perfs = await RecHelpers.PerformerNamesAsync(db, order.SelectMany(id => byId[id].topPerfs), cancellationToken) };
-
-        var items = order.Select(id =>
+        var confidence = Math.Min(1.0, profile.LikedCount / 15.0);
+        var candidates = scored
+            .Select(x => new ScoredCandidate(x.id, Math.Clamp(x.score, 0, 1), confidence,
+                RankedFeed.BasicDimensions(Math.Clamp(x.score, 0, 1), confidence)))
+            .ToList();
+        var names = new
         {
-            var r = byId[id];
+            Tags = await RecHelpers.TagNamesAsync(db, rows.SelectMany(r => r.topTags), cancellationToken),
+            Perfs = await RecHelpers.PerformerNamesAsync(db, rows.SelectMany(r => r.topPerfs), cancellationToken),
+        };
+
+        Explanation Explain(ScoredCandidate c)
+        {
+            var r = byId[c.Id];
             var tag = r.tagRaw / maxTag;
             var factors = new List<ExplanationFactor> { new("visual", "Visual match", w.visual * r.visual / den, $"{r.visual * 100:0}%") };
             if (r.topTags.Count > 0) factors.Add(new("tags", "Tags", w.tag * tag / den, string.Join(", ", r.topTags.Select(t => names.Tags.GetValueOrDefault(t, $"#{t}")))));
             if (r.topPerfs.Count > 0) factors.Add(new("performers", "Performers", w.perf * r.perf / den, string.Join(", ", r.topPerfs.Select(p => names.Perfs.GetValueOrDefault(p, $"#{p}")))));
-            return new ItemScore("video", id, Math.Clamp(scoreById[id], 0, 1), Math.Min(1.0, profile.LikedCount / 15.0), new Explanation(Band(scoreById[id]), factors));
-        }).ToList();
+            return new Explanation(Band(c.Score), factors);
+        }
 
-        return new RecommendationResult(items, Diagnostics: new Dictionary<string, object> { ["recommender"] = RecommenderId, ["candidates"] = ids.Count });
+        return RankedFeed.Build(request, "video", candidates, RankedFeed.BasicDimensionKeys, Explain,
+            new Dictionary<string, object> { ["recommender"] = RecommenderId, ["candidates"] = ids.Count },
+            ordered =>
+            {
+                if (novelty <= 1e-3) return ordered;
+                var window = Math.Min(ordered.Count, MmrWindow);
+                var head = ordered.Take(window).ToList();
+                var picked = RecHelpers.MmrIds(head.Select(c => (c.Id, c.Score)).ToList(), vectors, novelty, window);
+                var byCandidate = head.ToDictionary(c => c.Id);
+                return picked.Select(id => byCandidate[id]).Concat(ordered.Skip(window)).ToList();
+            });
     }
 
     public async Task<IReadOnlyList<ItemScore>> ScoreItemsAsync(ScoreRequest request, CancellationToken cancellationToken = default)

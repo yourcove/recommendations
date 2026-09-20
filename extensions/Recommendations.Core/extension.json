@@ -1,7 +1,7 @@
 {
   "id": "cove.community.recommendations.core",
   "name": "Recommendations Core",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Foundational infrastructure for recommendation extensions: engagement-based preference scoring, content & relational feature access, scalable candidate generation, and shared recommendation UI.",
   "author": "skier233",
   "url": "https://github.com/skier233/recommendations",
@@ -10,7 +10,7 @@
     "discovery",
     "ai"
   ],
-  "minCoveVersion": "0.7.1",
+  "minCoveVersion": "1.5.0",
   "entryDll": "Recommendations.Core.dll",
   "sharedAssemblies": [
     "Recommendations.Abstractions"

@@ -70,8 +70,24 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ extension: extensions })}\n`);
           NODE
 
-  build:
+  # Unit tests over the pure logic: signal fusion, calibration, and the feed request parsing. Independent of the
+  # per-extension packaging matrix below, and gating it — a release tag should not produce an artifact from a
+  # tree whose ranking maths is broken.
+  test:
     needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: Test
+        # Package mode, like the packaging job: CI has no sibling cove checkout to project-reference.
+        run: dotnet test tests/Recommendations.Tests/Recommendations.Tests.csproj -c Release -p:UseLocalCoveSource=false -p:UseLocalCoveCore=false
+
+  build:
+    needs: [validate, test]
     runs-on: ubuntu-latest
     strategy:
       matrix: ${{ fromJson(needs.validate.outputs.matrix) }}

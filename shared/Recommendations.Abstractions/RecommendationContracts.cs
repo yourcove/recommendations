@@ -47,7 +47,44 @@ public sealed record ItemScore(
 /// that the knob is a secondary/expert control.</summary>
 public sealed record RecommenderKnob(string Key, string Label, double Min, double Max, double Default, string? Description = null, string? Group = null, bool Advanced = false);
 
-/// <summary>What a recommender can do — surfaced to the UI so it only offers valid context/entity-type combos.</summary>
+/// <summary>A named score dimension a recommender produces per item — the overall score, and whatever it breaks
+/// that down into (e.g. performers / content / quality / audio). Declaring them lets the UI offer sorting AND
+/// range-filtering on each WITHOUT knowing anything about the recommender: "sort at random among videos whose
+/// performer score is above X" falls out of one generic control.
+/// <paramref name="Min"/>/<paramref name="Max"/> bound the slider. <paramref name="Centered"/> marks a dimension
+/// whose neutral point is 0 (a signed "vs your typical" belief) rather than a plain magnitude, so the UI can
+/// render it as −/+ around a midpoint.</summary>
+public sealed record RecommenderScoreField(
+    string Key,
+    string Label,
+    double Min,
+    double Max,
+    bool Centered = false,
+    string? Description = null);
+
+/// <summary>How a <see cref="ScoreCriterion"/> compares. Deliberately mirrors the numeric comparisons the host's
+/// standard filter offers, so a score criterion behaves exactly like any other numeric criterion (duration, frame
+/// rate, play count…) rather than being a one-off. Named here rather than reusing the host enum so this contract
+/// stays free of Cove host types.</summary>
+public enum ScoreComparison
+{
+    Equals,
+    NotEquals,
+    GreaterThan,
+    LessThan,
+    /// <summary>Inclusive on both bounds, matching the host's numeric BETWEEN.</summary>
+    Between,
+    NotBetween,
+}
+
+/// <summary>A constraint on one <see cref="RecommenderScoreField"/>, in the same
+/// (comparison, value, second value) shape the host's numeric criteria use. <paramref name="Value2"/> is the upper
+/// bound and is only read for <see cref="ScoreComparison.Between"/> / <see cref="ScoreComparison.NotBetween"/>.
+/// An item passes only if every criterion holds.</summary>
+public sealed record ScoreCriterion(string Key, ScoreComparison Comparison, double? Value, double? Value2 = null);
+
+/// <summary>What a recommender can do — surfaced to the UI so it only offers valid context/entity-type combos.
+/// <paramref name="ScoreFields"/> additionally drives the sort menu and the score range filters.</summary>
 public sealed record RecommenderDescriptor(
     string Id,
     string Label,
@@ -55,7 +92,9 @@ public sealed record RecommenderDescriptor(
     IReadOnlyList<RecommendationContext> Contexts,
     IReadOnlyList<string> SourceEntityTypes,
     IReadOnlyList<string> TargetEntityTypes,
-    IReadOnlyList<RecommenderKnob>? Knobs = null);
+    IReadOnlyList<RecommenderKnob>? Knobs = null,
+    IReadOnlyList<RecommenderScoreField>? ScoreFields = null,
+    bool SupportsRandomSort = false);
 
 /// <summary>A request for a ranked list of recommendations.</summary>
 public sealed record RecommendationRequest(
@@ -88,6 +127,24 @@ public sealed record RecommendationRequest(
     /// <summary>Sort direction for the ranked list. Default (false) = best-first (descending score); true =
     /// worst-first (ascending) — used to inspect what a signal scores LOWEST by isolating it via the knobs.</summary>
     public bool Ascending { get; init; }
+
+    /// <summary>What to rank by. Null or <see cref="SortByOverall"/> = the recommender's overall score. Otherwise a
+    /// <see cref="RecommenderScoreField.Key"/> to rank by that single dimension, <see cref="SortRandom"/> to shuffle
+    /// (deterministically, via <see cref="RandomSeed"/>), or <see cref="SortByCandidateOrder"/> to keep
+    /// <see cref="CandidateIds"/> in the order given — which is how a STANDARD cove sort (date, title, duration…)
+    /// composes with score filtering: the host sorts, the recommender only filters.</summary>
+    public string? SortKey { get; init; }
+
+    /// <summary>Seed for <see cref="SortRandom"/>, so paging is stable and "reshuffle" is a new seed.</summary>
+    public int? RandomSeed { get; init; }
+
+    /// <summary>Constraints on the recommender's declared score fields — non-matching items are dropped BEFORE
+    /// paging, so <see cref="RecommendationResult.TotalCount"/> reflects the filtered set.</summary>
+    public IReadOnlyList<ScoreCriterion>? ScoreFilters { get; init; }
+
+    public const string SortByOverall = "overall";
+    public const string SortRandom = "random";
+    public const string SortByCandidateOrder = "candidate";
 }
 
 /// <summary>A ranked recommendation result, plus optional paging cursor and inspector diagnostics.</summary>

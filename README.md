@@ -1,78 +1,91 @@
-# Cove Multi-Extension Template
+# Cove Recommendations
 
-Use this template when one repository owns multiple related Cove extensions. On
-GitHub, create new extension sets with the **Use this template** button.
+Personalised recommendations for [Cove](https://github.com/yourcove/cove). Learns what you like from the
+ratings and engagement you already produce while using your library, and ranks your whole collection against it.
 
-After creating a repository from the template, replace the example extension IDs,
-namespaces, manifest fields, catalog entries, and workflow matrix values with
-your real extension set.
+Two extensions:
 
-## Extension metadata lives in `extension.json`
+| Extension | What it does |
+| --- | --- |
+| **Recommendations: Core** (`cove.community.recommendations.core`) | The Recommended page, the per-video "Recommended" tab, settings, the shared plumbing every recommender builds on, and the **Your engagement** baseline recommender. |
+| **Recommendations: Tastes** (`cove.community.recommendations.tastes`) | The models. Ships the **full taste model** plus two simpler ones to compare against. |
 
-Each extension's `extension.json` is the single source of truth for its identity
-and metadata (`id`, `name`, `version`, `description`, `author`, `url`,
-`categories`, `minCoveVersion`, `entryDll`, `dependencies`). Do **not** redeclare
-any of these in C# — the example extensions extend `CoveExtensionBase`, which the
-host injects the parsed manifest into at load time and surfaces all of those
-values from it.
+## The models
 
-Implement whatever capability interfaces the extension needs alongside
-`CoveExtensionBase` and override only the methods you use:
+**Full taste model** — the primary one. Scores every video on four independent aspects: *performers* (faces,
+learned per-performer affinity, and an attribute prior so a performer you've never rated still gets a sensible
+read), *content* (tags and actions, a learned look axis, content-cluster fit, studio), *video quality* (a learned
+craft axis plus objective resolution/bitrate fidelity), and *audio* (a voice axis). Each aspect carries its own
+confidence and is calibrated against **your** library, so a score reads as "vs your typical" rather than as any
+absolute claim. Every result explains which aspect drove it.
 
-```csharp
-using Cove.Plugins;
-using Cove.Sdk;
+**Taste clusters** — splits your taste into distinct visual + tag niches and recommends across them, or from one.
+Simpler, and a clear way to see how your taste breaks up.
 
-// Scraper: keep the capability interface, drop all metadata properties.
-public sealed class ExampleScraperExtension : CoveExtensionBase, IScraperProvider { /* ... */ }
+**Overall affinity** — one global tag/visual/performer/studio profile, no clusters.
 
-// Downloader: same pattern.
-public sealed class ExampleDownloaderExtension : CoveExtensionBase, IDownloaderProvider { /* ... */ }
+**Your engagement** — ships with Core rather than Tastes, because it needs no AI data at all. It recommends
+nothing new: it ranks what you have already watched and rated by how much your engagement says you liked it, and
+explains each score. That makes it both the honest baseline the learning models are judged against and something
+useful on day one, before any model has anything to learn from.
 
-// UI: CoveExtensionBase already implements IUIExtension; override GetUIManifest() to contribute UI.
-public sealed class ExampleUiExtension : CoveExtensionBase { /* ... */ }
-```
+## Using it
 
-`extensions/catalog.json` lists every extension (id, path, tag prefix);
-`scripts/validate-extension-repo.mjs` checks the catalog and manifests stay
-consistent (including that each manifest's `minCoveVersion` is at least the
-repo's `CoveMinVersion`).
+The **Recommended** page behaves like any other Cove list: the same search, filters, sorting, display modes,
+multi-select and bulk actions. On top of that, the recommender contributes its own score dimensions as ordinary
+filter criteria and sort options — so "shuffle among videos whose performer score is above 0.3" is just Sort:
+Random plus a *Performers score* filter.
 
-## Build
+Other tabs: **Training** (rate the items the model is least sure about — the fastest way to teach it) and
+**Taste profile** (what it thinks you like, and dislike).
+
+Recommendations are **precomputed**. Each user's model is built in the background and persisted, and the whole
+library is scored against it at startup and after every model rebuild, so opening the page reads precomputed
+results rather than scoring your library on the spot. A rating schedules a rebuild, debounced to at most one per
+hour per user.
+
+## Requirements
+
+- Cove **1.5.0** or newer.
+- **AI Visual** (`cove.community.ai.visual`) for the taste models, which are built on visual embeddings. AI Faces
+  and AI Audio are optional and improve the performers and audio aspects respectively. Signals you don't have
+  simply lower confidence — they never bias a score.
+
+Recommendations improve with use. A brand-new library with no ratings has nothing to learn from yet; rate a
+handful of videos (the Training tab is the quickest route) and the feed becomes meaningful.
+
+## Building
 
 ```powershell
-dotnet build -c Release
+dotnet build -c Release      # extensions
+npm run build:ui             # UI bundles
+npm run typecheck            # UI type-checks against a sibling cove checkout
 ```
 
-## Cove host references and central build wiring
+`scripts/stage-local-extensions.ps1` builds everything and copies it into a local Cove install for testing.
 
-The repo-root `Directory.Build.props` and `Directory.Build.targets` centralize
-all Cove host-contract wiring, so each `.csproj` stays minimal. Any project with
-an `extension.json` automatically references the Cove host contracts
-(`Cove.Sdk` + `Cove.Core`) **compile-only** — the host provides them (and the EF
-Core / Npgsql / Pgvector infrastructure) at runtime, so they are never shipped in
-the package.
+`extensions/catalog.json` lists every extension (id, path, tag prefix), and
+`scripts/validate-extension-repo.mjs` checks the catalog and manifests stay consistent.
 
-- **Local dev:** if this repo is checked out beside `cove`
-  (`..\cove\src\Cove.Sdk` / `..\cove\src\Cove.Core` exist), `UseLocalCoveSource`
-  and `UseLocalCoveCore` auto-enable and the projects reference the local Cove
-  source via `ProjectReference`, so contract changes flow without a NuGet bump.
-- **CI / external authors:** otherwise the projects use `PackageReference` to the
-  published `Cove.Sdk` / `Cove.Core` packages at `CoveSdkVersion` /
-  `CoveCoreVersion` (both default to `CoveMinVersion`).
+### Cove host references
 
-Force package mode even with a sibling `cove` checkout present:
+The repo-root `Directory.Build.props` / `Directory.Build.targets` centralise the Cove host wiring, so each
+`.csproj` stays minimal. Any project with an `extension.json` references the Cove host contracts (`Cove.Sdk` +
+`Cove.Core`) compile-only — the host provides them at runtime, so they are never shipped in the package.
+
+- **Local dev:** with `cove` checked out beside this repo, the projects reference it by `ProjectReference`, so
+  contract changes flow through without a package bump.
+- **CI / external authors:** otherwise the published `Cove.Sdk` / `Cove.Core` packages are used.
+
+Force package mode even with a sibling checkout:
 
 ```powershell
 dotnet build -p:UseLocalCoveSource=false -p:UseLocalCoveCore=false
 ```
 
-## Release tags
+## Releases
 
-Each extension has its own tag prefix:
+Each extension has its own tag prefix, and CI packages only the extension matching the pushed tag:
 
-- `example-ui/v0.1.0`
-- `example-downloader/v0.1.0`
-- `example-scraper/v0.1.0`
-
-The CI workflow only packages the extension that matches the pushed tag.
+- `core/v1.0.0`
+- `tastes/v1.0.0`

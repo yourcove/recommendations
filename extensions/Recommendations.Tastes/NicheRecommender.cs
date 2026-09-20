@@ -2,6 +2,7 @@ using Cove.Core.Entities;
 using Cove.Core.Interfaces;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Recommendations.Abstractions;
 using Recommendations.Toolkit;
 using System.Text.Json;
@@ -10,8 +11,19 @@ using EntityRef = Recommendations.Abstractions.EntityRef;
 namespace Recommendations.Tastes;
 
 /// <summary>
-/// "Taste niches (v2)" — the next-generation cluster recommender. Three things set it apart from the original
-/// clusters recommender:
+/// "Full taste model" — the primary recommender, and the only one still under active development.
+/// <para>
+/// It scores every candidate on FOUR independent aspects — performers (faces, learned per-performer affinity, an
+/// attribute cold-start prior), content (tags/actions, the learned look axis, cluster fit, studio), video quality
+/// (a learned craft axis plus objective fidelity) and audio (an ECAPA voice axis) — each carrying its own
+/// CONFIDENCE, each calibrated against the user's own library so a value reads as "vs your typical" rather than
+/// as anything absolute, then fuses them into one ranking key (see docs/FUSION_DESIGN.md). Those four aspects are
+/// what the UI exposes as sortable, filterable score dimensions and as the per-result "Why" breakdown.
+/// </para>
+/// <para>
+/// Clustering is one INPUT to that model rather than its organising idea — the class name is historical. Three
+/// things still set its clustering apart from the older <see cref="ClusterRecommender"/>:
+/// </para>
 /// <list type="number">
 /// <item>MULTIMODAL, honest niches — clusters on each liked video's visual embedding CONCATENATED with its
 /// coverage×IDF tag signature (<see cref="RecHelpers.RefinedMultimodalClusters"/>), so niches split by CONTENT
@@ -29,18 +41,20 @@ namespace Recommendations.Tastes;
 /// so you see your whole range of tastes, not just the dominant one.</item>
 /// </list>
 /// Built to be the substrate later ideas layer onto (per-niche embedding directions, dwell-localised
-/// attribution, compound-concept tags). Videos only.
+/// attribution, compound-concept tags). Videos and images.
 /// </summary>
-public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteModelStore modelStore) : IRecommender, ITasteClusters, ITasteProfile, ITrainingGround, IRecommenderEvaluable
+public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteModelStore modelStore, ILogger<NicheRecommender> logger)
+    : IRecommender, ITasteClusters, ITasteProfile, ITrainingGround, IRecommenderEvaluable, IRecommenderWarmup
 {
     public const string RecommenderId = "cove.community.recommendations.niche";
     private readonly IServiceScopeFactory _scopeFactory = scopeFactory;
     private readonly TasteModelStore _modelStore = modelStore;
+    private readonly ILogger<NicheRecommender> _logger = logger;
 
     private static readonly RecommenderDescriptor Descriptor = new(
         RecommenderId,
-        "Taste niches (v2)",
-        "Splits your taste into honest, non-overlapping niches (count chosen from the data). Each niche learns its OWN tag/performer/studio affinity from the videos near it — your global taste shrunk toward what you actually like within that niche — so the same tag can score differently per niche. The feed spreads across your niches for built-in variety.",
+        "Full taste model",
+        "Judges every video on four separate things — who's in it, what happens, how it's shot, and how it sounds — and combines them into one score. Each aspect is learned from your ratings and engagement, calibrated against your own library (so \"good\" means good *for you*, not in the abstract), and reported per result with a confidence, so you can see which aspect drove a recommendation and filter or sort on any of them. Taste clusters are one input among many.",
         [RecommendationContext.GlobalFeed, RecommendationContext.SimilarToEntity, RecommendationContext.ScoreItems, RecommendationContext.Training],
         SourceEntityTypes: ["video", "image"],
         TargetEntityTypes: ["video", "image"],
@@ -70,7 +84,20 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
             new RecommenderKnob("qualityCraftWeight", "→ Craft axis", 0, 1, 1.00, "Within Video quality: the learned cinematography/look axis from your explicit \"video quality\" ratings.", "Video quality (advanced)", true),
             new RecommenderKnob("objectiveQualityWeight", "→ Fidelity (resolution + bitrate)", 0, 1, 1.00, "Within Video quality: objective file fidelity — resolution and bitrate — calibrated to whether higher fidelity actually tracks your enjoyment.", "Video quality (advanced)", true),
             new RecommenderKnob("audioLift", "→ Audio assertiveness", 0, 3, 1.60, "Multiplies the Audio belief so it contributes more decisively in BOTH directions (surfacing liked audio and letting disliked audio drag a video down) instead of being suppressed by the shared dead-band. 1 = neutral; higher = more assertive.", "Audio (advanced)", true),
-        ]);
+        ],
+        // The dimensions you can sort and range-filter on. The four aspect beliefs are CENTERED: 0 is your
+        // library-typical, so "> 0.2" reads as "clearly better than typical for me on this aspect" — the same scale
+        // the per-result Why breakdown shows. Overall and confidence are plain 0…1 magnitudes.
+        ScoreFields:
+        [
+            new RecommenderScoreField("overall", "Overall score", 0, 1, false, "The fused ranking score across all four aspects."),
+            new RecommenderScoreField("performers", "Performers", -1, 1, true, "WHO is in it — faces, learned per-performer affinity, and the attribute prior. 0 = typical for your library."),
+            new RecommenderScoreField("content", "Content", -1, 1, true, "WHAT happens — tags/actions, look axis, cluster fit, studio. 0 = typical for your library."),
+            new RecommenderScoreField("quality", "Video quality", -1, 1, true, "How it's shot — the craft axis plus objective fidelity. 0 = typical for your library."),
+            new RecommenderScoreField("audio", "Audio", -1, 1, true, "The voice/audio axis. 0 = typical for your library."),
+            new RecommenderScoreField("confidence", "Confidence", 0, 1, false, "How much data backs the score — filter this up to see only items the model is sure about."),
+        ],
+        SupportsRandomSort: true);
 
     public RecommenderDescriptor Describe() => Descriptor;
 
@@ -235,14 +262,10 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
         await using var scope = _scopeFactory.CreateAsyncScope();
         var sp = scope.ServiceProvider;
         var built = await BuildAsync(userId, core, sp, cancellationToken);
-        var db = sp.GetRequiredService<DbContext>();
-        var names = await RecHelpers.TagNamesAsync(db, built.Niches.SelectMany(n => n.TopTags.Take(6).Select(t => t.id)), cancellationToken);
         return built.Niches.Select(n => new TasteCluster(
             n.Index.ToString(),
             n.Label,
             n.MemberIds.Count,
-            n.MemberIds.Take(8).Select(id => new EntityRef("video", id)).ToList(),
-            n.TopTags.Take(6).Select(t => new ClusterTag(names.GetValueOrDefault(t.id, $"#{t.id}"), t.weight)).ToList(),
             $"{n.MemberIds.Count} liked videos")).ToList();
     }
 
@@ -285,7 +308,7 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
         var built = await GetOrBuildBuiltAsync(request.UserId, request.Core, sp, cancellationToken);
         var msBuild = swBuild.ElapsedMilliseconds;
         if (built.Niches.Count == 0)
-            return Empty("no taste niches yet (need liked videos)");
+            return Empty("no taste model yet (rate or watch some videos first)");
 
         // Candidate generation: pull per niche (or one when scoped), keeping the KNN vectors so we don't refetch.
         var targets = request.ClusterId is { } cid && int.TryParse(cid, out var ci)
@@ -307,14 +330,32 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
 
         // Determine the UNIVERSE to rank, then compute each candidate's RAW per-signal values. That work
         // (fetching embeddings/meta/faces + niche assignment) is knob-INDEPENDENT and by far the most expensive
-        // part, so it's cached per (user, universe, scope) — paging, sort direction and ALL knob tuning then
-        // reuse it instead of re-fetching the whole library every request.
+        // part, so it is PRECOMPUTED at startup and after every model rebuild.
+        //
+        // Crucially the warm pass covers the WHOLE library, so a filter or search — which can only ever narrow it —
+        // is served by taking the matching subset of those rows rather than re-scoring anything. Only two cases
+        // genuinely need fresh scoring: a SEED (its neighbours are scored against the seed) and a niche SCOPE (rows
+        // are scored against that one niche, not each candidate's best-fitting one). Those fall back to the
+        // short-lived row cache, which paging, sort direction and ALL knob tuning still reuse.
+        var unscoped = scopedNiche is null && seedFeat is null && seedSem is null;
+        bool libraryWide = request.CandidateIds is not { Count: > 0 } && unscoped;
+        var warmHit = false;
         List<Cand> rows;
         if (seedFeat is not null || seedSem is not null)
         {
             // SimilarToEntity: rank the seed's visual neighbours (per-seed, so not cached).
             var seedVecs = await RecHelpers.KnnUnionVecsAsync(search, seedFeat, seedSem, request.Limit * 6 + 50, exclude, cancellationToken);
             rows = await BuildScoredRowsAsync(seedVecs, built, scopedNiche, seedFeat, seedSem, repo, db, cancellationToken);
+        }
+        else if (unscoped && TryTakeWarm(_warmVideo, request.UserId, built, needsFullLibrary: !libraryWide) is { } warmRows)
+        {
+            if (request.CandidateIds is { Count: > 0 } filtered)
+            {
+                var allowed = filtered.ToHashSet();
+                rows = warmRows.Where(r => allowed.Contains(r.Id)).ToList();
+            }
+            else rows = warmRows;
+            warmHit = true;
         }
         else
         {
@@ -336,67 +377,78 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
         var candCount = rows.Count;
 
         // Stage-0 calibration, folded into THIS pass when it's the whole (unfiltered) library — a filtered/seeded/
-        // scoped pool isn't a valid library-wide reference, so those calibrate from a strided sample instead.
-        bool libraryWide = request.CandidateIds is not { Count: > 0 } && scopedNiche is null && seedFeat is null && seedSem is null;
+        // scoped pool isn't a valid library-wide reference, so those calibrate from a strided sample instead. A warm
+        // hit is already calibrated (the warm pass folds it in), so this is a no-op there.
         built = await EnsureCalibratedAsync(built, request.UserId, libraryWide ? rows : null, repo, db, cancellationToken);
+        // A cold library-wide read just did the warm pass's work by hand — publish it so the background warm this
+        // miss scheduled sees the model is already warm and returns instead of scanning the library a second time.
+        if (libraryWide && !warmHit) _warmVideo[request.UserId] = new WarmSet(rows, built, DateTime.UtcNow, rows.Count < UniverseCap);
 
         // FUSION v5 (recommendations/docs/FUSION_DESIGN.md). Per candidate: calibrate signals → per-aspect belief
         // (Stage 1) → dead-band + gate + atanh-accumulate into a ranking key K (Stage 2). Score = σ(τ·K) is display
         // only; ranking is K. Confidence is a separate lever-weighted mean of aspect confidences. Scoring reads
         // (never mutates) cached rows, so concurrent requests with different levers are safe.
         var subW = new SubWeights(sub.face, sub.perfAff, sub.tag, sub.taste, sub.niche, sub.studio, sub.perfAttr, sub.qualityCraft, sub.objQual, sub.audioLift);
-        (double key, double conf) Overall(Cand r)
+        // Every declared score dimension for every candidate, computed once (see DimIndex for the layout): the four
+        // aspect beliefs, the fused overall score, and its confidence. Sorting and range-filtering both read this,
+        // so "shuffle among videos whose performer score is above 0.3" costs one pass, not two.
+        var dims = new Dictionary<int, double[]>(rows.Count);
+        var confById = new Dictionary<int, double>(rows.Count);
+        foreach (var r in rows)
         {
             var (p, cc, q, au) = CandAspects(r, built, subW);
-            return FuseOverall([(w.performers, p), (w.content, cc), (w.quality, q), (w.audio, au)]);
+            var o = FuseOverall([(w.performers, p), (w.content, cc), (w.quality, q), (w.audio, au)]);
+            confById[r.Id] = o.conf;
+            dims[r.Id] = [1.0 / (1.0 + Math.Exp(-DisplayGain * o.key)), p.Value, cc.Value, q.Value, au.Value, o.conf];
         }
-        var confById = new Dictionary<int, double>(rows.Count);
-        var scored = rows.Select(r => { var o = Overall(r); confById[r.Id] = o.conf; return (r, score: 1.0 / (1.0 + Math.Exp(-DisplayGain * o.key))); }).ToList();
-        var total = scored.Count;
-        var byScore = (request.Ascending
-                ? scored.OrderBy(x => x.score).ThenBy(x => x.r.Id)
-                : scored.OrderByDescending(x => x.score).ThenBy(x => x.r.Id))
+
+        // Filtering, sorting, diversity and paging are the SHARED pipeline every recommender runs — see
+        // RankedFeed. Only the diversity rule below is specific to this model; the rest must not differ between
+        // recommenders, which is exactly why it doesn't live here any more.
+        var byRow = rows.ToDictionary(r => r.Id);
+        var candidates = rows
+            .Select(r => new ScoredCandidate(r.Id, dims[r.Id][0], confById[r.Id], dims[r.Id]))
             .ToList();
 
-        // DIVERSITY re-rank (descending feed only). Greedily fill a FIXED-size top window: each pick's score is
-        // penalized by how many already-picked results share its content cluster (contentDiversity) or its
-        // performers (performerDiversity), so the top spreads across clusters/people instead of the same few. The
-        // window is fixed and the greedy is deterministic → pagination stays consistent. Below the window it's
-        // pure score order. Off (both 0) → pure strict score sort, exactly as before.
-        List<(Cand r, double score)> orderedList;
-        if (!request.Ascending && (div.content > 1e-3 || div.performer > 1e-3))
+        var (pageCandidates, total) = RankedFeed.SelectPage(request, candidates, DimensionKeys, ordered =>
         {
-            int poolSize = Math.Min(byScore.Count, 1200);
+            if (div.content <= 1e-3 && div.performer <= 1e-3) return ordered;
+            // Greedily fill a FIXED-size top window: each pick's score is penalized by how many already-picked
+            // results share its content cluster (contentDiversity) or its performers (performerDiversity), so the
+            // top spreads across clusters/people instead of the same few. The window is fixed and the greedy is
+            // deterministic → pagination stays consistent. Below the window it's pure score order.
+            int poolSize = Math.Min(ordered.Count, 1200);
             int window = Math.Min(poolSize, 400);
-            var pool = byScore.Take(poolSize).ToList();
+            var pool = ordered.Take(poolSize).ToList();
             var used = new bool[pool.Count];
             var nicheCount = new Dictionary<int, int>();
             var perfCount = new Dictionary<int, int>();
-            var picked = new List<(Cand r, double score)>(window);
+            var picked = new List<ScoredCandidate>(window);
             for (var k = 0; k < window; k++)
             {
                 double best = double.NegativeInfinity; int bi = -1;
                 for (var i = 0; i < pool.Count; i++)
                 {
                     if (used[i]) continue;
-                    var cr = pool[i].r;
+                    var cr = byRow[pool[i].Id];
                     var pen = div.content * 0.20 * nicheCount.GetValueOrDefault(cr.Niche)
-                            + div.performer * 0.20 * cr.PerfIds.Sum(p => perfCount.GetValueOrDefault(p));
-                    var adj = pool[i].score - pen;
+                            + div.performer * 0.20 * cr.PerfIds.Sum(pp => perfCount.GetValueOrDefault(pp));
+                    var adj = pool[i].Score - pen;
                     if (adj > best) { best = adj; bi = i; }
                 }
                 if (bi < 0) break;
-                used[bi] = true; var pr = pool[bi].r;
+                used[bi] = true;
+                var pr = byRow[pool[bi].Id];
                 nicheCount[pr.Niche] = nicheCount.GetValueOrDefault(pr.Niche) + 1;
-                foreach (var p in pr.PerfIds) perfCount[p] = perfCount.GetValueOrDefault(p) + 1;
+                foreach (var pp in pr.PerfIds) perfCount[pp] = perfCount.GetValueOrDefault(pp) + 1;
                 picked.Add(pool[bi]);
             }
-            var pickedIds = picked.Select(x => x.r.Id).ToHashSet();
-            orderedList = picked.Concat(byScore.Where(x => !pickedIds.Contains(x.r.Id))).ToList();
-        }
-        else orderedList = byScore;
-
-        var paged = orderedList.Skip(request.Offset).Take(request.Limit).ToList();
+            var pickedIds = picked.Select(x => x.Id).ToHashSet();
+            return picked.Concat(ordered.Where(x => !pickedIds.Contains(x.Id))).ToList();
+        });
+        if (total == 0) return Empty("no videos match those score filters");
+        var sortKey = string.IsNullOrWhiteSpace(request.SortKey) ? RecommendationRequest.SortByOverall : request.SortKey!;
+        var paged = pageCandidates.Select(c => (r: byRow[c.Id], score: c.Score)).ToList();
 
         var labelByNiche = built.Niches.ToDictionary(n => n.Index, n => n.Label);
         var names = new
@@ -473,6 +525,8 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
             ["recommender"] = RecommenderId,
             ["niches"] = built.Niches.Count,
             ["candidates"] = candCount,
+            ["matched"] = total,
+            ["sort"] = sortKey,
             ["taste_vector"] = built.TasteVector is not null,
             ["face_centroids"] = built.LikedFaceCentroids.Count,
             ["disliked_clusters"] = built.DislikedNicheCentroids.Count,
@@ -485,6 +539,7 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
             ["attr_priors"] = built.PerfAttrPrior?.Count ?? 0,
             ["pseudo_perfs"] = built.PseudoPerfIds?.Count ?? 0,
             ["ms_build"] = msBuild,
+            ["warm"] = warmHit,
         });
     }
 
@@ -493,7 +548,9 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
         await using var scope = _scopeFactory.CreateAsyncScope();
         var sp = scope.ServiceProvider;
         var repo = sp.GetRequiredService<IEmbeddingRepository>();
-        var built = await BuildAsync(request.UserId, request.Core, sp, cancellationToken);
+        // The cached/persisted model, NOT a fresh BuildAsync — scoring a handful of items must never trigger a full
+        // model rebuild (auto-curation calls this per item, which made every call pay for clustering).
+        var built = await GetOrBuildBuiltAsync(request.UserId, request.Core, sp, cancellationToken);
         var ids = request.Items.Where(i => i.EntityType.Equals("video", StringComparison.OrdinalIgnoreCase)).Select(i => i.EntityId).ToList();
         var vecs = await RecHelpers.GetVisualVectorsAsync(repo, ids, cancellationToken);
         var (wF, wS) = RecHelpers.VisualWeights(null);
@@ -614,14 +671,14 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
 
     private static string AspectName(int idx) => idx switch { 0 => "performers", 1 => "content", 2 => "quality", _ => "audio" };
     private static double? NN(double v) => double.IsNaN(v) ? null : v;   // NaN → null (JSON-safe)
-    private static double Std(double[] x)
+    internal static double Std(double[] x)
     {
         if (x.Length < 2) return 0;
         double m = x.Average(), s = 0;
         foreach (var v in x) s += (v - m) * (v - m);
         return Math.Sqrt(s / x.Length);
     }
-    private static double Spearman(double[] a, double[] b)
+    internal static double Spearman(double[] a, double[] b)
     {
         if (a.Length != b.Length || a.Length < 3) return double.NaN;
         double[] ra = RankArray(a), rb = RankArray(b);
@@ -629,7 +686,7 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
         for (var i = 0; i < ra.Length; i++) { double xa = ra[i] - ma, xb = rb[i] - mb; num += xa * xb; da += xa * xa; db += xb * xb; }
         return da <= 1e-12 || db <= 1e-12 ? double.NaN : num / Math.Sqrt(da * db);
     }
-    private static double[] RankArray(double[] x)
+    internal static double[] RankArray(double[] x)
     {
         var idx = Enumerable.Range(0, x.Length).OrderBy(i => x[i]).ToArray();
         var r = new double[x.Length];
@@ -733,6 +790,11 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
             var cals = image ? ImageCalibrations : Calibrations;
             return cals is not null && cals.TryGetValue(key, out var c) ? c.D(raw) : 0;
         }
+
+        /// <summary>A model with nothing learned in it, returned while a real one is still being built in the
+        /// background. Every caller already guards on <c>Niches.Count == 0</c> (there is no model until the user
+        /// has engaged with something), so this needs no new handling — it just routes through those paths.</summary>
+        public static Built Empty { get; } = new([], [], [], [], [], null, [], [], [], [], [], null);
     }
 
     private async Task<Built> BuildAsync(int userId, ICoreServices core, IServiceProvider sp, CancellationToken ct)
@@ -1054,6 +1116,10 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
         return outv;
     }
 
+    /// <summary>The per-candidate dimension array's layout, and the keys sorting and score filters resolve
+    /// against. Index order IS the array order, and must match the ScoreFields the descriptor advertises.</summary>
+    private static readonly string[] DimensionKeys = ["overall", "performers", "content", "quality", "audio", "confidence"];
+
     private static RecommendationResult Empty(string note) => new([], Diagnostics: new Dictionary<string, object> { ["note"] = note });
     private static string Band(double s) => s >= 0.6 ? "Strong" : s >= 0.35 ? "Good" : s >= 0.15 ? "Possible" : "Weak";
 
@@ -1148,7 +1214,7 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
     private const double GateMid = 0.5;         // coverage at which an aspect reaches ~full influence
     private const double DisplayGain = 1.6;     // τ in σ(τ·K); cosmetic (ranking uses K directly)
     private const int CalibSampleCap = 4000;    // library sample size for the reference distributions
-    private readonly record struct AspectBelief(double Value, double Coverage, double Conf);
+    internal readonly record struct AspectBelief(double Value, double Coverage, double Conf);
     private readonly record struct SubWeights(double Face, double PerfAff, double Tag, double Taste, double Niche, double Studio, double PerfAttr, double QualityCraft, double ObjQual, double AudioLift);
     private static readonly SubWeights DefaultSubWeights = new(0.45, 0.55, 0.45, 0.30, 0.35, 0.15, 0.15, 1.00, 1.00, 1.60);
 
@@ -1190,7 +1256,7 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
     }
 
     /// <summary>Linear interpolation over a uniform grid at position <paramref name="q"/>∈[0,1].</summary>
-    private static double InterpGrid(double[] grid, double q)
+    internal static double InterpGrid(double[] grid, double q)
     {
         var g = grid.Length;
         if (g == 0) return 0;
@@ -1224,10 +1290,13 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
     /// (so this never assumes bigger=better). Confidence 0.6 when both are known, 0.4 with one, 0 with neither
     /// (a video with no dimension data contributes nothing rather than a spurious low). Duration is deliberately
     /// excluded — length is not a quality axis.</summary>
-    private static (double raw, double conf) ObjectiveQuality(int height, long bitRate)
+    internal static (double raw, double conf) ObjectiveQuality(int height, long bitRate)
     {
-        double res = height > 0 ? Math.Log(1.0 + height) / Math.Log(3001.0) : double.NaN;          // ~0 (SD) → ~1 (3000p+)
-        double br = bitRate > 0 ? Math.Log(1.0 + bitRate) / Math.Log(30_000_001.0) : double.NaN;   // ~0 → ~1 (30 Mbit/s+)
+        // Both scales SATURATE at their reference point by design — past ~3000p and ~30 Mbit/s, more of either is
+        // not more fidelity to a viewer — so they clamp there rather than running on. Without the clamp an 8K /
+        // 120 Mbit file reads >1, which is outside the [0,1] every other raw signal is calibrated on.
+        double res = height > 0 ? Math.Min(1.0, Math.Log(1.0 + height) / Math.Log(3001.0)) : double.NaN;          // ~0 (SD) → 1 (3000p+)
+        double br = bitRate > 0 ? Math.Min(1.0, Math.Log(1.0 + bitRate) / Math.Log(30_000_001.0)) : double.NaN;   // ~0 → 1 (30 Mbit/s+)
         bool hr = !double.IsNaN(res), hb = !double.IsNaN(br);
         if (hr && hb) return (0.5 * res + 0.5 * br, 0.6);
         if (hr) return (res, 0.4);
@@ -1282,7 +1351,7 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
 
     /// <summary>Isotonic regression (PAVA) of (x∈[0,1], y) pairs → a monotone non-decreasing fit resampled onto a
     /// uniform <paramref name="gridN"/>-point grid over [0,1].</summary>
-    private static double[] FitIsotonicGrid(List<(double x, double y)> pairs, int gridN)
+    internal static double[] FitIsotonicGrid(List<(double x, double y)> pairs, int gridN)
     {
         var pts = pairs.OrderBy(p => p.x).ToList();
         var nn = pts.Count;
@@ -1321,7 +1390,7 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
 
     /// <summary>Center c such that the DEAD-BANDED curve averages ~0 over the (uniform-percentile) reference — so
     /// presence stays mean-neutral (T5) even for a skewed convex curve. Mean is monotone in c ⇒ bisection.</summary>
-    private static double CenterForDeadband(double[] grid)
+    internal static double CenterForDeadband(double[] grid)
     {
         double MeanDb(double c) { double s = 0; foreach (var v in grid) s += DeadBanded(v - c); return s / grid.Length; }
         double lo = -1.5, hi = 1.5;
@@ -1331,7 +1400,7 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
 
     /// <summary>Stage 1 — fuse the present sub-signals of one aspect. value = c²-weighted mean of the calibrated
     /// d's; coverage = configured-evidence fraction present; conf = coverage·(1 − ½·pairwise-disagreement).</summary>
-    private static AspectBelief FuseAspect(ReadOnlySpan<(double k, double c, double d)> sigs)
+    internal static AspectBelief FuseAspect(ReadOnlySpan<(double k, double c, double d)> sigs)
     {
         double cnum = 0, cden = 0, wsum = 0, wd = 0;
         Span<(double w, double d)> present = stackalloc (double, double)[sigs.Length];
@@ -1383,11 +1452,11 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
     }
 
     // Stage 2 helpers.
-    private static double DeadBanded(double v) => Math.Sign(v) * Math.Max(0, Math.Abs(v) - DeadBand) / (1 - DeadBand);
-    private static double Smoothstep(double t) { t = Math.Clamp(t, 0, 1); return t * t * (3 - 2 * t); }
+    internal static double DeadBanded(double v) => Math.Sign(v) * Math.Max(0, Math.Abs(v) - DeadBand) / (1 - DeadBand);
+    internal static double Smoothstep(double t) { t = Math.Clamp(t, 0, 1); return t * t * (3 - 2 * t); }
 
     /// <summary>Stage 2 — accumulate the four aspect beliefs into a ranking key K and an overall confidence.</summary>
-    private static (double key, double conf) FuseOverall((double lever, AspectBelief a)[] aspects)
+    internal static (double key, double conf) FuseOverall((double lever, AspectBelief a)[] aspects)
     {
         double k = 0, cnum = 0, cden = 0;
         foreach (var (lever, a) in aspects)
@@ -1402,56 +1471,283 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
     }
 
     // ── Caching + durable persistence ─────────────────────────────────────────
-    // Two layers. (1) The per-request ROW cache: the knob-independent scored universe, keyed by (user, universe,
-    // scope), short TTL + small LRU — reused across pages/sort/knobs within a session (rows hold only scalars +
-    // tiny id lists, no embeddings). (2) The per-user MODEL (Built): expensive to compute, so it's held in-memory
-    // AND persisted to the KV store, surviving restarts. Reads serve the cached/persisted model even if somewhat
-    // stale (fast cold load); freshness comes from event-driven REFRESH — a rating, debounced to ≤ once/hour,
-    // rebuilds + re-persists in the BACKGROUND — plus a force-refresh of every known user on startup. A model past
-    // the serve ceiling is rebuilt synchronously on read.
+    // Three layers, because the two expensive things are independent.
+    // (1) The per-user MODEL (Built): clustering + attribution + centroids. Held in memory AND persisted to the KV
+    //     store, so it survives restarts. Reads serve the cached/persisted model even if somewhat stale (fast cold
+    //     load); freshness comes from event-driven REFRESH — a rating, debounced to ≤ once/hour, rebuilds and
+    //     re-persists in the BACKGROUND. A model past the serve ceiling is rebuilt synchronously on read.
+    // (2) The WARM SET: the whole library scored against that model (embeddings + meta + faces + audio for every
+    //     video), plus the calibration folded out of it. This is what the default feed reads, and it is far too
+    //     expensive to pay on a page open — so it is precomputed at STARTUP and re-computed in the background
+    //     whenever the model is rebuilt. It has no TTL: it is valid exactly as long as the model instance it was
+    //     scored against is the current one (reference identity), which is what makes "warm" mean "correct".
+    // (3) The per-request ROW cache: the same knob-independent scoring for a FILTERED/scoped universe, which can't
+    //     be precomputed because the filter isn't known ahead of time. Short TTL + small LRU, so paging, sort
+    //     direction and knob tuning within a session reuse one pass.
     private const long CacheTtlMs = 5 * 60 * 1000;                              // row-cache freshness
     private const int MaxRowCacheEntries = 8;
     private static readonly TimeSpan RefreshDebounce = TimeSpan.FromHours(1);   // ≤ one rebuild/user/hour from ratings
-    private static readonly TimeSpan MaxServeAge = TimeSpan.FromHours(24);      // beyond this a read rebuilds synchronously
+    private static readonly TimeSpan MaxServeAge = TimeSpan.FromHours(24);      // beyond this a read schedules a background rebuild
+    /// <summary>The longest a REQUEST will wait for the per-user model lock. Generous for the only fast path that
+    /// holds it (loading the persisted model), far short of a build — so a request that arrives mid-build gives up
+    /// quickly and reports "building" instead of inheriting the wait this design removed.</summary>
+    private static readonly TimeSpan ModelLoadWait = TimeSpan.FromSeconds(5);
     private sealed record RowCacheEntry(List<Cand> Rows, long AtMs);
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, RowCacheEntry> _rowCache = new();
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, (Built Built, DateTime BuiltUtc)> _builtCache = new();
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, SemaphoreSlim> _userLocks = new();
     private static SemaphoreSlim UserLock(int userId) => _userLocks.GetOrAdd(userId, _ => new SemaphoreSlim(1, 1));
 
-    private async Task<Built> GetOrBuildBuiltAsync(int userId, ICoreServices core, IServiceProvider sp, CancellationToken ct)
+    /// <summary>A library-wide scored pass, tied to the exact <see cref="Built"/> instance it was scored against.
+    /// <paramref name="Model"/> doubles as the validity token: once the model is rebuilt the reference changes and
+    /// the set is ignored (and re-warmed), so a warm read can never serve rows from a superseded model.
+    /// <paramref name="Complete"/> is false when the pass hit <see cref="UniverseCap"/> and therefore covers only
+    /// part of the library — such a set can still serve the default feed (which was always capped the same way)
+    /// but must NOT be used to answer a filtered query, since matches beyond the cap would silently vanish.</summary>
+    private sealed record WarmSet(List<Cand> Rows, Built Model, DateTime WarmedUtc, bool Complete);
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, WarmSet> _warmVideo = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, WarmSet> _warmImage = new();
+    /// <summary>Serializes warm passes per user, so startup, a model refresh and a cold read don't each kick off
+    /// their own duplicate library scan. A background caller skips when it's held; a refresh WAITS for it, because
+    /// its whole job is to leave the new model warm.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, SemaphoreSlim> _warmGates = new();
+    private static SemaphoreSlim WarmGate(int userId) => _warmGates.GetOrAdd(userId, _ => new SemaphoreSlim(1, 1));
+    /// <summary>Users with a warm pass actually running, for the status endpoint.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> _warming = new();
+    /// <summary>Users whose MODEL is being (re)built right now. Distinct from <see cref="_warming"/>, which is the
+    /// cheaper library-scoring pass that follows it: with no model yet, a build is the whole wait the page is
+    /// sitting through, and the status endpoint has to be able to say so.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> _building = new();
+
+    // ── Eviction ─────────────────────────────────────────────────────────────
+    // Everything above is keyed by user and lives for the process. That's free on a single-user server, but a
+    // shared one would accumulate a whole scored library per user who ever opened the page and never give it
+    // back. So a user's in-memory state is dropped once they've been idle a while: the MODEL is persisted and
+    // reloads in milliseconds, and the warm set rebuilds in the background on their next visit, so eviction costs
+    // a returning user nothing that isn't already paid for on a cold start.
+    private static readonly TimeSpan IdleEvictionAfter = TimeSpan.FromHours(6);
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, DateTime> _lastSeen = new();
+
+    /// <summary>Record activity for a user and opportunistically evict everyone who's gone quiet.</summary>
+    private static void Touch(int userId)
     {
-        var nowUtc = DateTime.UtcNow;
-        if (_builtCache.TryGetValue(userId, out var e) && nowUtc - e.BuiltUtc < MaxServeAge)
-            return e.Built;
-        // Serialize per-user so concurrent first-requests don't stampede a rebuild.
-        var gate = UserLock(userId);
-        await gate.WaitAsync(ct);
+        var now = DateTime.UtcNow;
+        _lastSeen[userId] = now;
+        foreach (var (otherId, seen) in _lastSeen)
+        {
+            if (otherId == userId || now - seen < IdleEvictionAfter) continue;
+            // Never evict mid-pass: the warm gate is held for the duration, and dropping the model underneath it
+            // would have the pass publish a set keyed to a model nothing else references.
+            if (_warming.ContainsKey(otherId)) continue;
+            if (!_lastSeen.TryRemove(otherId, out _)) continue;
+            _builtCache.TryRemove(otherId, out _);
+            DropCachedRows(otherId);
+            _userLocks.TryRemove(otherId, out _);
+            _warmGates.TryRemove(otherId, out _);
+        }
+    }
+
+    /// <summary>Warm-up state for one user, so the UI can say "preparing…" instead of hanging on a cold library
+    /// pass. <paramref name="State"/> is "ready" (the default feed is served from precomputed rows), "warming"
+    /// (a pass is running now) or "cold" (nothing precomputed — the next read pays for it).</summary>
+    public WarmStatus GetWarmStatus(int userId)
+    {
+        var hasModel = _builtCache.TryGetValue(userId, out var m);
+        var warm = _warmVideo.TryGetValue(userId, out var w) && hasModel && ReferenceEquals(w.Model, m.Built) ? w : null;
+        // "building" only when there is nothing to serve. A rebuild behind a model the user can already see is
+        // invisible to them by design — reporting it would put a progress banner over a working feed.
+        var servable = hasModel && m.Built.Niches.Count > 0;
+        var state = warm is not null ? "ready"
+            : _warming.ContainsKey(userId) ? "warming"
+            : !servable && _building.ContainsKey(userId) ? "building"
+            : "cold";
+        return new WarmStatus(state, servable ? m.BuiltUtc : null, warm?.WarmedUtc, warm?.Rows.Count ?? 0,
+            state switch
+            {
+                "ready" => "Recommendations are precomputed and serve instantly.",
+                "warming" => "Scoring your library — results will be fast once this finishes.",
+                "building" => "Building your taste model from what you've rated and watched.",
+                _ => "Nothing precomputed yet; the next open scores your library first.",
+            });
+    }
+
+    /// <summary>Score the whole library against the user's current model and publish it as the warm set (plus the
+    /// calibration folded out of that same pass). Idempotent — returns immediately when the current model is
+    /// already warm or another pass is in flight — and best-effort: a failure just leaves reads to do it lazily.</summary>
+    /// <param name="wait">True to queue behind an in-flight pass instead of skipping. A refresh must wait — its
+    /// job is to leave the NEW model warm, and the pass it would skip is warming the OLD one.</param>
+    private async Task WarmUserAsync(int userId, CancellationToken ct, bool wait = false)
+    {
+        var gate = WarmGate(userId);
+        if (wait) { try { await gate.WaitAsync(ct); } catch (OperationCanceledException) { return; } }
+        else if (!await gate.WaitAsync(0, CancellationToken.None)) return;   // a pass is already running
+        _warming[userId] = 0;
         try
         {
-            if (_builtCache.TryGetValue(userId, out e) && nowUtc - e.BuiltUtc < MaxServeAge)
-                return e.Built;
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var sp = scope.ServiceProvider;
+            var core = sp.GetRequiredService<ICoreServices>();
+            var repo = sp.GetRequiredService<IEmbeddingRepository>();
+            var db = sp.GetRequiredService<DbContext>();
+            // Already off the request path, so this is one of the callers that SHOULD build if there's no model.
+            var built = await GetOrBuildBuiltAsync(userId, core, sp, ct, allowBlockingBuild: true);
+            if (_warmVideo.TryGetValue(userId, out var existing) && ReferenceEquals(existing.Model, built))
+                return;                                        // this exact model is already warm
+            if (built.Niches.Count == 0) return;               // no taste model yet — nothing to score against
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var ids = await RecHelpers.AllVideoIdsAsync(db, UniverseCap, ct);
+            var complete = ids.Count < UniverseCap;            // hit the cap ⇒ this pass may not span the library
+            if (!complete)
+                _logger.LogWarning("User {UserId}'s library exceeds the {UniverseCap}-item scoring cap; the warm pass covers only part of it, and filtered queries will score their own candidates.", userId, UniverseCap);
+            var vecs = await RecHelpers.GetVisualVectorsAsync(repo, ids, ct);
+            var rows = await BuildScoredRowsAsync(vecs, built, null, null, null, repo, db, ct);
+            if (rows.Count == 0)
+            {
+                _logger.LogInformation("Warm-up pass for user {UserId} scored nothing from {Candidates} candidate(s) — no visual embeddings yet?", userId, ids.Count);
+                return;
+            }
+            // Calibrating from THESE rows is the whole point of doing it here: the library-wide pass is the correct
+            // percentile reference, so the feed never pays for a separate sample scan.
+            var calibrated = await EnsureCalibratedAsync(built, userId, rows, repo, db, ct);
+            _warmVideo[userId] = new WarmSet(rows, calibrated, DateTime.UtcNow, complete);
+            _logger.LogInformation("Warmed {Rows} video(s) for user {UserId} in {ElapsedMs}ms.", rows.Count, userId, sw.ElapsedMilliseconds);
+
+            // Images are a much smaller universe and only worth warming once an image model exists.
+            if (calibrated.ImageTasteVector is not null || calibrated.ImageLikedCentroids is { Count: > 0 })
+            {
+                var imgIds = await RecHelpers.AllImageIdsAsync(db, UniverseCap, ct);
+                var imgComplete = imgIds.Count < UniverseCap;
+                var imgVecs = await RecHelpers.GetImageVisualVectorsAsync(repo, imgIds, ct);
+                var imgRows = await BuildImageRowsAsync(imgVecs, calibrated, repo, db, ct);
+                if (imgRows.Count > 0)
+                {
+                    var imgCal = await EnsureImageCalibratedAsync(calibrated, userId, imgRows, repo, db, ct);
+                    _warmImage[userId] = new WarmSet(imgRows, imgCal, DateTime.UtcNow, imgComplete);
+                    // Image calibration republished the model, so re-point the video warm set at that same instance
+                    // — otherwise the very next video read would see a reference mismatch and re-warm for nothing.
+                    if (!ReferenceEquals(imgCal, calibrated)) _warmVideo[userId] = new WarmSet(rows, imgCal, DateTime.UtcNow, complete);
+                }
+            }
+        }
+        catch (OperationCanceledException) { /* shutdown, or the caller gave up — not a failure */ }
+        catch (Exception ex)
+        {
+            // Best-effort: reads fall back to scoring lazily, which is slow but correct. Logged because "every page
+            // open is slow" is otherwise a mystery with no trace of the pass that should have prevented it.
+            _logger.LogError(ex, "Warm-up pass failed for user {UserId}; their reads will score the library lazily until it next runs.", userId);
+        }
+        // Release the semaphore we actually took, not a fresh one from the map: eviction can drop the entry, and
+        // Release() on a re-created SemaphoreSlim(1, 1) throws SemaphoreFullException out of a fire-and-forget task.
+        finally { _warming.TryRemove(userId, out _); gate.Release(); }
+    }
+
+    /// <summary>The precomputed library-wide rows for this user, or null when they'd be stale (model rebuilt), were
+    /// never computed, or can't answer this particular query. A miss also schedules a background warm so the NEXT
+    /// open is fast.</summary>
+    /// <param name="needsFullLibrary">Set when the caller will take a SUBSET of these rows (a filter or search).
+    /// A capped pass doesn't span the library, so answering a filter from it would silently drop every match past
+    /// the cap — those queries fetch their own candidates instead.</param>
+    private List<Cand>? TryTakeWarm(System.Collections.Concurrent.ConcurrentDictionary<int, WarmSet> slot, int userId, Built built, bool needsFullLibrary)
+    {
+        if (slot.TryGetValue(userId, out var w) && ReferenceEquals(w.Model, built))
+            return needsFullLibrary && !w.Complete ? null : w.Rows;
+        _ = WarmUserAsync(userId, CancellationToken.None);
+        return null;
+    }
+
+    /// <summary>The user's taste model, for a REQUEST path — never blocking on a build.
+    ///
+    /// Building a model is clustering + attribution + centroids over the whole engaged history: tens of seconds on
+    /// a small library, minutes on a large one. No page open may pay for that inline, so this never builds:
+    ///
+    /// <list type="bullet">
+    /// <item>A cached or persisted model is served even PAST <see cref="MaxServeAge"/> — a day-old ranking is
+    /// better than a hung page — and going stale only schedules a background rebuild on the way out.</item>
+    /// <item>With no model at all (a first-ever visit) there is nothing to serve, so it starts the build in the
+    /// background and returns <see cref="Built.Empty"/>. <see cref="GetWarmStatus"/> then reports "building" and
+    /// the page shows progress and polls, instead of holding a request open for minutes.</item>
+    /// </list>
+    ///
+    /// Background callers (startup warm, the debounced refresh) pass <paramref name="allowBlockingBuild"/> —
+    /// they are the ones that SHOULD block, since building is their whole job.</summary>
+    private async Task<Built> GetOrBuildBuiltAsync(int userId, ICoreServices core, IServiceProvider sp, CancellationToken ct, bool allowBlockingBuild = false)
+    {
+        Touch(userId);   // every read path funnels through here, so this is the one place activity must be noted
+        var nowUtc = DateTime.UtcNow;
+        if (_builtCache.TryGetValue(userId, out var e))
+            return ServeAndRefreshIfStale(userId, e.Built, e.BuiltUtc, nowUtc);
+
+        // Serialize per-user so concurrent first-requests don't stampede a rebuild.
+        //
+        // A build holds this same lock for its whole duration, so a request must NOT queue on it unboundedly —
+        // that is the hang this method exists to avoid, just moved from the build to the lock. It waits only long
+        // enough for the one fast thing that happens under the lock (read + deserialize the persisted model, and
+        // re-derive the attribute prior), then gives up and lets the page report "building" and poll.
+        var gate = UserLock(userId);
+        if (allowBlockingBuild) await gate.WaitAsync(ct);
+        else if (!await gate.WaitAsync(ModelLoadWait, ct))
+            return _builtCache.TryGetValue(userId, out var published) ? published.Built : Built.Empty;
+        Built? serve = null;
+        var serveStamp = default(DateTime);
+        try
+        {
+            if (_builtCache.TryGetValue(userId, out e)) { serve = e.Built; serveStamp = e.BuiltUtc; }
             // Durable store: deserialize (version-checked) + re-hydrate the in-memory-only attribute prior. Serving
             // a persisted model skips the whole expensive build (clustering/attribution/centroids) on cold start.
-            if (await LoadPersistedAsync(userId, sp, ct) is { } loaded && nowUtc - loaded.BuiltUtc < MaxServeAge)
+            else if (await LoadPersistedAsync(userId, sp, ct) is { } loaded)
             {
                 _builtCache[userId] = (loaded.Built, loaded.BuiltUtc);
-                return loaded.Built;
+                serve = loaded.Built;
+                serveStamp = loaded.BuiltUtc;
+                _logger.LogInformation("Loaded the persisted taste model for user {UserId} (built {BuiltUtc:u}, {Niches} niches).",
+                    userId, loaded.BuiltUtc, loaded.Built.Niches.Count);
             }
-            var built = await BuildAsync(userId, core, sp, ct);
-            _builtCache[userId] = (built, nowUtc);
-            await PersistAsync(userId, built, nowUtc, ct);
-            return built;
+            else if (allowBlockingBuild)
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var built = await BuildAsync(userId, core, sp, ct);
+                _builtCache[userId] = (built, nowUtc);
+                await PersistAsync(userId, built, nowUtc, ct);
+                _logger.LogInformation("Built the taste model for user {UserId} in {ElapsedMs}ms ({Niches} niches, {Engaged} engaged items).",
+                    userId, sw.ElapsedMilliseconds, built.Niches.Count, built.Seen.Count);
+                return built;
+            }
         }
         finally { gate.Release(); }
+
+        // Outside the lock, always: a refresh takes the SAME per-user lock with a zero timeout, so scheduling one
+        // while still holding it would be a silent no-op.
+        if (serve is null)
+        {
+            _logger.LogInformation("No taste model for user {UserId} yet — building it in the background.", userId);
+            ScheduleRefresh(userId);
+            return Built.Empty;
+        }
+        return ServeAndRefreshIfStale(userId, serve, serveStamp, nowUtc);
     }
+
+    /// <summary>Serve a model, scheduling a background rebuild when it has aged past <see cref="MaxServeAge"/>.
+    /// Must be called with no per-user lock held (see <see cref="ScheduleRefresh"/>).</summary>
+    private Built ServeAndRefreshIfStale(int userId, Built built, DateTime builtUtc, DateTime nowUtc)
+    {
+        if (nowUtc - builtUtc >= MaxServeAge) ScheduleRefresh(userId);
+        return built;
+    }
+
+    /// <summary>Kick off a background model rebuild. Fire-and-forget by design: the caller is a request that must
+    /// not wait for it. <c>force: false</c> so the ≤1/hour debounce still applies — a rebuild that keeps failing
+    /// then retries on an hourly cadence rather than on every page open.</summary>
+    private void ScheduleRefresh(int userId) => _ = RefreshAsync(userId, force: false, CancellationToken.None);
 
     /// <summary>Rebuild + persist a user's model, honoring the ≤1/hour debounce unless <paramref name="force"/>.
     /// Background-safe: own scope, non-blocking per-user lock, swallows errors. Drives rating events + startup warm.</summary>
     private async Task RefreshAsync(int userId, bool force, CancellationToken ct)
     {
+        var rebuilt = false;
         var gate = UserLock(userId);
         if (!await gate.WaitAsync(0, ct)) return;         // a build/refresh is already in flight for this user
+        _building[userId] = 0;
         try
         {
             if (!force && _builtCache.TryGetValue(userId, out var e) && DateTime.UtcNow - e.BuiltUtc < RefreshDebounce)
@@ -1459,35 +1755,101 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
             await using var scope = _scopeFactory.CreateAsyncScope();
             var core = scope.ServiceProvider.GetRequiredService<ICoreServices>();
             var nowUtc = DateTime.UtcNow;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             var built = await BuildAsync(userId, core, scope.ServiceProvider, ct);
             _builtCache[userId] = (built, nowUtc);
-            _rowCache.Clear();                             // the cached universe was scored vs the OLD model — drop it
+            // Everything scored against the OLD model is now stale. Only THIS user's entries — one user rating a
+            // video used to wipe every other user's cached universe too.
+            DropCachedRows(userId);
             await PersistAsync(userId, built, nowUtc, ct);
+            rebuilt = true;
+            _logger.LogInformation("Rebuilt the taste model for user {UserId} in {ElapsedMs}ms ({Niches} niches, {Engaged} engaged items).",
+                userId, sw.ElapsedMilliseconds, built.Niches.Count, built.Seen.Count);
         }
-        catch { /* best-effort: on failure the prior model simply stays in place */ }
-        finally { gate.Release(); }
+        catch (OperationCanceledException) { /* shutdown, or the caller gave up — not a failure */ }
+        catch (Exception ex)
+        {
+            // Best-effort: the prior model stays in place and the next trigger retries. Logged because a model
+            // that never rebuilds is indistinguishable from one that has nothing new to learn.
+            _logger.LogError(ex, "Failed to rebuild the taste model for user {UserId}; the previous model stays in use.", userId);
+        }
+        finally { _building.TryRemove(userId, out _); gate.Release(); }
+        // Re-warm OUTSIDE the lock (warming re-enters GetOrBuildBuiltAsync), so the next feed open is fast against
+        // the new model instead of paying for a full library pass.
+        if (rebuilt) await WarmUserAsync(userId, ct, wait: true);
+    }
+
+    /// <summary>Re-point warm sets from an old model instance to the calibrated copy that replaced it.
+    ///
+    /// Warm validity is reference identity against the current model, and folding in a calibration produces a NEW
+    /// instance. Without this, opening the images feed (which adds the image calibration table) would invalidate
+    /// the VIDEO warm set — costing a full library rescan on the next video open — even though nothing that
+    /// affects video row scoring changed. Only the calibration tables differ, and rows don't depend on those.</summary>
+    private static void RepointWarm(int userId, Built oldModel, Built newModel)
+    {
+        if (_warmVideo.TryGetValue(userId, out var v) && ReferenceEquals(v.Model, oldModel))
+            _warmVideo[userId] = v with { Model = newModel };
+        if (_warmImage.TryGetValue(userId, out var i) && ReferenceEquals(i.Model, oldModel))
+            _warmImage[userId] = i with { Model = newModel };
+    }
+
+    /// <summary>Drop one user's cached scored universes (row cache + warm sets).</summary>
+    private static void DropCachedRows(int userId)
+    {
+        _warmVideo.TryRemove(userId, out _);
+        _warmImage.TryRemove(userId, out _);
+        foreach (var key in _rowCache.Keys)
+            if (key.StartsWith($"{userId}:", StringComparison.Ordinal) || key.StartsWith($"img:{userId}:", StringComparison.Ordinal))
+                _rowCache.TryRemove(key, out _);
     }
 
     /// <summary>A rating/engagement change for this user — schedule a debounced background model refresh.</summary>
     public void OnEngagementChanged(int userId) => _ = RefreshAsync(userId, force: false, CancellationToken.None);
 
-    /// <summary>On startup: force-rebuild every user with a persisted model (sequentially, in the background) so
-    /// models reflect changes made while the server was down. Unknown users build lazily on first use.</summary>
-    public async Task WarmStartAsync(CancellationToken ct)
+    /// <summary>On startup, for every user with a persisted model: bring the model up to date and precompute the
+    /// library-wide scored pass, so opening the recommendations page reads precomputed rows instead of scoring the
+    /// whole library first. Sequential and background — it never blocks host startup, and unknown users still build
+    /// lazily on first use.
+    ///
+    /// Hydrating the persisted model FIRST is what keeps this to a single expensive pass: it gives the refresh
+    /// below a real build timestamp to debounce against, so a model that's already fresh (the normal restart) skips
+    /// straight to warming instead of rebuilding and then warming a second time.</summary>
+    public async Task WarmAsync(CancellationToken ct = default)
     {
         List<int> users;
-        try { users = await _modelStore.GetKnownUserIdsAsync(ct); } catch { return; }
+        try { users = await _modelStore.GetKnownUserIdsAsync(ct); }
+        catch (Exception ex) { _logger.LogError(ex, "Startup warm-up could not list users with a persisted taste model; skipping it."); return; }
+        if (users.Count == 0) return;
+
+        _logger.LogInformation("Warming recommendations for {UserCount} user(s) with a persisted taste model.", users.Count);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         foreach (var userId in users)
         {
             if (ct.IsCancellationRequested) break;
-            await RefreshAsync(userId, force: true, ct);
+            try
+            {
+                await using var scope = _scopeFactory.CreateAsyncScope();
+                var core = scope.ServiceProvider.GetRequiredService<ICoreServices>();
+                await GetOrBuildBuiltAsync(userId, core, scope.ServiceProvider, ct, allowBlockingBuild: true);
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex) { _logger.LogWarning(ex, "Startup warm-up could not load the taste model for user {UserId}; it will build lazily.", userId); }
+            await RefreshAsync(userId, force: false, ct);   // rebuilds (and re-warms) only a stale model
+            await WarmUserAsync(userId, ct);                // no-op when the refresh already warmed this model
         }
+        _logger.LogInformation("Startup warm-up finished in {ElapsedMs}ms.", sw.ElapsedMilliseconds);
     }
 
     private async Task<(Built Built, DateTime BuiltUtc)?> LoadPersistedAsync(int userId, IServiceProvider sp, CancellationToken ct)
     {
         var json = await _modelStore.LoadAsync(userId, ct);
-        if (json is null || TryDeserializeModel(json) is not { } parsed) return null;   // absent / version mismatch / corrupt → rebuild
+        if (json is null) return null;
+        if (TryDeserializeModel(json) is not { } parsed)
+        {
+            // Version mismatch (the expected case after a ModelVersion bump) or corruption — either way, rebuild.
+            _logger.LogInformation("Discarding the persisted taste model for user {UserId}: it is not readable at model version {ModelVersion}. Rebuilding.", userId, ModelVersion);
+            return null;
+        }
         // PerfAttrPrior is in-memory-only — recompute it from the persisted AttrCells + current performer attributes.
         var db = sp.GetRequiredService<DbContext>();
         var priors = parsed.Built.AttrCells is { Count: > 0 } cells ? await ComputePerfAttrPriorsAsync(db, cells, ct) : new();
@@ -1497,7 +1859,14 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
     private async Task PersistAsync(int userId, Built built, DateTime builtUtc, CancellationToken ct)
     {
         if (!_modelStore.Ready) return;
-        try { await _modelStore.SaveAsync(userId, SerializeModel(built, builtUtc), ct); } catch { /* best effort */ }
+        try { await _modelStore.SaveAsync(userId, SerializeModel(built, builtUtc), ct); }
+        catch (OperationCanceledException) { /* shutdown — the in-memory model is still current */ }
+        catch (Exception ex)
+        {
+            // Best-effort: the in-memory model is unaffected. Logged because the cost lands on the NEXT restart,
+            // which silently rebuilds from scratch instead of loading in milliseconds.
+            _logger.LogError(ex, "Could not persist the taste model for user {UserId}; it will be rebuilt after the next restart.", userId);
+        }
     }
 
     // ── Model (de)serialization ───────────────────────────────────────────────
@@ -1585,6 +1954,7 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
         // serve-age isn't silently extended (only publish if the entry is still the exact model we just calibrated).
         if (_builtCache.TryGetValue(userId, out var e) && ReferenceEquals(e.Built, built))
             _builtCache[userId] = (calibrated, e.BuiltUtc);
+        RepointWarm(userId, built, calibrated);
         return calibrated;
     }
 
@@ -1605,6 +1975,7 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
         var calibrated = built with { ImageCalibrations = BuildCalibrations(sample) };
         if (_builtCache.TryGetValue(userId, out var e) && ReferenceEquals(e.Built, built))
             _builtCache[userId] = (calibrated, e.BuiltUtc);
+        RepointWarm(userId, built, calibrated);
         return calibrated;
     }
 
@@ -1698,10 +2069,23 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
             Kb("tasteWeight", 0.30), Kb("nicheWeight", 0.35), Kb("studioWeight", 0.15), Kb("performerAttributeWeight", 0.15),
             Kb("qualityCraftWeight", 1.00), Kb("objectiveQualityWeight", 1.00), Kb("audioLift", 1.60));
 
+        var libraryWide = request.CandidateIds is not { Count: > 0 };
         var universeKey = request.CandidateIds is { Count: > 0 } fu ? $"f{fu.Count}:{HashIds(fu)}" : "all";
         var rowKey = $"img:{request.UserId}:{universeKey}";
+        var warmHit = false;
         List<Cand> rows;
-        if (!TryGetCachedRows(rowKey, out rows!))
+        // As with videos: the warm pass spans the whole image library, so a filtered universe is a subset of it.
+        if (TryTakeWarm(_warmImage, request.UserId, built, needsFullLibrary: !libraryWide) is { } warmRows)
+        {
+            if (request.CandidateIds is { Count: > 0 } filtered)
+            {
+                var allowed = filtered.ToHashSet();
+                rows = warmRows.Where(r => allowed.Contains(r.Id)).ToList();
+            }
+            else rows = warmRows;
+            warmHit = true;
+        }
+        else if (!TryGetCachedRows(rowKey, out rows!))
         {
             var universeIds = request.CandidateIds is { Count: > 0 } cu ? cu.Distinct().ToList() : await RecHelpers.AllImageIdsAsync(db, UniverseCap, cancellationToken);
             var vecs = await RecHelpers.GetImageVisualVectorsAsync(repo, universeIds, cancellationToken);
@@ -1709,20 +2093,27 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
             StoreCachedRows(rowKey, rows);
         }
         if (rows.Count == 0) return Empty("no scorable images (missing image embeddings?)");
-        var libraryWide = request.CandidateIds is not { Count: > 0 };
         built = await EnsureImageCalibratedAsync(built, request.UserId, libraryWide ? rows : null, repo, db, cancellationToken);
+        if (libraryWide && !warmHit) _warmImage[request.UserId] = new WarmSet(rows, built, DateTime.UtcNow, rows.Count < UniverseCap);
 
+        // Same dimension/filter/sort pipeline as videos, so the sort menu and score filters behave identically on
+        // both content types (audio simply has no signal on an image, so it sits at its neutral value).
         var confById = new Dictionary<int, double>(rows.Count);
-        var scored = rows.Select(r =>
+        var dims = new Dictionary<int, double[]>(rows.Count);
+        foreach (var r in rows)
         {
             var (p, c, q, a) = CandAspects(r, built, sub);
             var o = FuseOverall([(w.performers, p), (w.content, c), (w.quality, q), (w.audio, a)]);
             confById[r.Id] = o.conf;
-            return (r, score: 1.0 / (1.0 + Math.Exp(-DisplayGain * o.key)));
-        }).ToList();
-        var total = scored.Count;
-        var ordered = (request.Ascending ? scored.OrderBy(x => x.score).ThenBy(x => x.r.Id) : scored.OrderByDescending(x => x.score).ThenBy(x => x.r.Id)).ToList();
-        var paged = ordered.Skip(request.Offset).Take(request.Limit).ToList();
+            dims[r.Id] = [1.0 / (1.0 + Math.Exp(-DisplayGain * o.key)), p.Value, c.Value, q.Value, a.Value, o.conf];
+        }
+        // Same shared pipeline as the video path — no diversity re-rank for images.
+        var byRow = rows.ToDictionary(r => r.Id);
+        var candidates = rows.Select(r => new ScoredCandidate(r.Id, dims[r.Id][0], confById[r.Id], dims[r.Id])).ToList();
+        var (pageCandidates, total) = RankedFeed.SelectPage(request, candidates, DimensionKeys);
+        if (total == 0) return Empty("no images match those score filters");
+        var sortKey = string.IsNullOrWhiteSpace(request.SortKey) ? RecommendationRequest.SortByOverall : request.SortKey!;
+        var paged = pageCandidates.Select(c => (r: byRow[c.Id], score: c.Score)).ToList();
 
         var names = new
         {
@@ -1764,6 +2155,8 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
             ["recommender"] = RecommenderId,
             ["entity"] = "image",
             ["candidates"] = rows.Count,
+            ["matched"] = total,
+            ["sort"] = sortKey,
             ["image_taste"] = built.ImageTasteVector is not null,
             ["image_clusters"] = built.ImageLikedCentroids?.Count ?? 0,
             ["image_calibrated"] = built.ImageCalibrations?.Count ?? 0,

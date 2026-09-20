@@ -8,6 +8,14 @@
     <!-- Maps HTTP endpoints, so it needs the ASP.NET Core shared framework (host-provided at runtime). -->
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <ProjectReference Include="..\..\shared\Recommendations.Abstractions\Recommendations.Abstractions.csproj" />
+    <!-- The engagement recommender shares the ranking pipeline (filter/sort/page) with every other recommender. -->
+    <ProjectReference Include="..\..\shared\Recommendations.Toolkit\Recommendations.Toolkit.csproj" />
+  </ItemGroup>
+
+  <!-- The filter/criterion parsing this exposes to the tests is internal on purpose: it is an implementation
+       detail of the endpoints, but it reads untrusted request JSON, so it is exactly what wants pinning. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Recommendations.Tests" />
   </ItemGroup>
 
   <!-- Cove host contracts are referenced centrally and compile-only by ..\..\Directory.Build.targets. -->

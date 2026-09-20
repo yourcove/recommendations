@@ -9,6 +9,13 @@
     <ProjectReference Include="..\..\shared\Recommendations.Toolkit\Recommendations.Toolkit.csproj" />
   </ItemGroup>
 
+  <!-- The signal-fusion and calibration maths (docs/FUSION_DESIGN.md) is internal — it is not a contract anyone
+       outside this assembly should bind to — but it is pure, it decides every ranking, and a regression in it is
+       silent. The tests pin its documented properties. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Recommendations.Tests" />
+  </ItemGroup>
+
   <!-- Cove host contracts (Cove.Sdk + Cove.Core, EF Core, Pgvector) are referenced centrally and
        compile-only by ..\..\Directory.Build.targets. -->
 </Project>

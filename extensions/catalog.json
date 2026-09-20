@@ -8,18 +8,6 @@
       "tagPrefix": "core/"
     },
     {
-      "name": "Recommendations.Content",
-      "id": "cove.community.recommendations.content",
-      "path": "extensions/Recommendations.Content",
-      "tagPrefix": "content/"
-    },
-    {
-      "name": "Recommendations.Deep",
-      "id": "cove.community.recommendations.deep",
-      "path": "extensions/Recommendations.Deep",
-      "tagPrefix": "deep/"
-    },
-    {
       "name": "Recommendations.Tastes",
       "id": "cove.community.recommendations.tastes",
       "path": "extensions/Recommendations.Tastes",
