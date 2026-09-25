@@ -1,5 +1,6 @@
 using Cove.Core.Entities;
 using Cove.Core.Interfaces;
+using Cove.Plugins;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -1586,7 +1587,7 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
         {
             await using var scope = _scopeFactory.CreateAsyncScope();
             var sp = scope.ServiceProvider;
-            var core = sp.GetRequiredService<ICoreServices>();
+            var core = ResolveCore(sp);
             var repo = sp.GetRequiredService<IEmbeddingRepository>();
             var db = sp.GetRequiredService<DbContext>();
             // Already off the request path, so this is one of the callers that SHOULD build if there's no model.
@@ -1735,6 +1736,13 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
         return built;
     }
 
+    /// <summary>Core's services for a background pass. Core registers them in ITS container, which this extension's
+    /// isolated container can't see — so they come from the exchange Core publishes them to. (Request paths don't
+    /// need this: Core hands its own instance over on the request.)</summary>
+    private static ICoreServices ResolveCore(IServiceProvider sp)
+        => sp.GetRequiredService<IExtensionServiceExchange>().GetAll<ICoreServices>().FirstOrDefault()
+           ?? throw new InvalidOperationException("Recommendations Core hasn't published its services — is it installed and enabled?");
+
     /// <summary>Kick off a background model rebuild. Fire-and-forget by design: the caller is a request that must
     /// not wait for it. <c>force: false</c> so the ≤1/hour debounce still applies — a rebuild that keeps failing
     /// then retries on an hourly cadence rather than on every page open.</summary>
@@ -1753,7 +1761,7 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
             if (!force && _builtCache.TryGetValue(userId, out var e) && DateTime.UtcNow - e.BuiltUtc < RefreshDebounce)
                 return;                                    // rebuilt recently — the "max once/hour" gate
             await using var scope = _scopeFactory.CreateAsyncScope();
-            var core = scope.ServiceProvider.GetRequiredService<ICoreServices>();
+            var core = ResolveCore(scope.ServiceProvider);
             var nowUtc = DateTime.UtcNow;
             var sw = System.Diagnostics.Stopwatch.StartNew();
             var built = await BuildAsync(userId, core, scope.ServiceProvider, ct);
@@ -1829,7 +1837,7 @@ public sealed class NicheRecommender(IServiceScopeFactory scopeFactory, TasteMod
             try
             {
                 await using var scope = _scopeFactory.CreateAsyncScope();
-                var core = scope.ServiceProvider.GetRequiredService<ICoreServices>();
+                var core = ResolveCore(scope.ServiceProvider);
                 await GetOrBuildBuiltAsync(userId, core, scope.ServiceProvider, ct, allowBlockingBuild: true);
             }
             catch (OperationCanceledException) { break; }

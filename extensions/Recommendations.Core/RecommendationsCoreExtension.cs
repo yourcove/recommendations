@@ -65,6 +65,10 @@ public sealed class RecommendationsCoreExtension : FullExtensionBase
         // the settings singleton so the DI-resolved scorer can read per-user rating neutrals through it.
         services.GetRequiredService<RecSettings>().SetStore(Store);
         PublishContributions<IRecommender>(services);
+        // Satellites live in their own isolated containers, so ICoreServices registered above is invisible to
+        // them. Their background work (model rebuilds, warm-up) has no request to carry it in, so they pull it
+        // from the exchange instead.
+        PublishContributions<ICoreServices>(services);
         return Task.CompletedTask;
     }
 
